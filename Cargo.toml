@@ -1,0 +1,19 @@
+[package]
+edition      = "2024"
+name         = "xiaozhi-core"
+rust-version = "1.88"
+version      = "0.1.0"
+
+# 纯逻辑核心层：no_std 兼容，可在 host (std) 上单元测试。
+# 硬件相关代码（I2S/I2C 寄存器读写、DMA）放在 xiaozhi-s3 固件 crate。
+#
+# 本 crate 是独立 workspace 根：
+# - 不继承父目录 .cargo/config.toml 里的 esp target / build-std / -nostartfiles
+# - 因此 `cargo test` 默认在 host (x86_64) 上运行，无需额外 flag
+
+# 空 workspace 根，避免向上查找父 workspace
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]
