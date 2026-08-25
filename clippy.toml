@@ -1,0 +1,15 @@
+# Clippy 配置 - 针对嵌入式项目优化
+# https://rust-lang.github.io/rust-clippy/configuration.html
+
+# 栈大小阈值 (字节)
+# ESP32-S3 的默认栈大小较小，需要特别注意
+stack-size-threshold = 1024
+
+# 类型复杂度
+type-complexity-threshold = 250
+
+# 认知复杂度
+cognitive-complexity-threshold = 25
+
+# 嵌套深度
+excessive-nesting-threshold = 4
