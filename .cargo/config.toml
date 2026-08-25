@@ -1,0 +1,11 @@
+# xiaozhi-core 是纯逻辑 crate, 在 host (x86_64) 上单元测试。
+# 覆盖父目录 (esp 仓库) .cargo/config.toml 的全局设置:
+#   - [build] target    -> host (替换 esp target)
+#   - [build] rustflags -> 空 (host 不需要 -nostartfiles, 该 flag 已在 esp 侧改为 per-target)
+#   - [unstable] build-std -> 空 (host 有预编译 std, 无需从源码构建)
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = []
+
+[unstable]
+build-std = []
