@@ -5,6 +5,7 @@
 //! - 采样率与 I2S 时钟计算
 //! - Codec 寄存器配置序列
 //! - 音频状态机
+//! - 板级规则 (电源状态分类等)
 //!
 //! 硬件相关代码（I2S/I2C 寄存器读写、DMA）放在 `xiaozhi-s3` 固件 crate。
 
@@ -12,3 +13,4 @@
 #![deny(unsafe_code)]
 
 pub mod audio;
+pub mod board;

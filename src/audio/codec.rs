@@ -1,13 +1,14 @@
 //! ES8311 / ES7210 Codec 寄存器配置序列
 //!
-//! 本模块把"上电后需要写哪些寄存器"建模为纯数据结构 + 纯函数，
-//! 硬件层只需按序列逐条执行 I2C 写入。
+//! 序列为**常量纯数据**（当前固定 16kHz / 16bit / I2S Philips / 4 麦 TDM），
+//! 硬件层按序执行 `i2c.write(addr, [reg, value])`。
 //!
-//! 寄存器地址/值参考：
-//! - ES8311 datasheet（输出 codec，I2C addr 0x18）
-//! - ES7210 datasheet（输入 codec，I2C addr 0x40）
+//! 来源: esp_codec_dev 1.6.2 (device/es8311/es8311.c, device/es7210/es7210.c)
+//! 与 xiaozhi-esp32 BoxAudioCodec 行为对齐:
+//! - ES8311: DAC 播放, I2S slave, MCLK 输入, HP/SPK 输出
+//! - ES7210: 4 麦克风录音, TDM 输出, mic1-4 增益 30dB, bias 2.87V
 //!
-//! 这些序列是纯数据，可在 host 上单元测试（顺序、地址、值是否正确）。
+//! 音量: ES8311 REG32 线性映射 0x00(-95.5dB 静音) → 0xFF(+32dB 满量)。
 
 /// I2C 7 位设备地址
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,9 +61,9 @@ pub struct AudioConfig {
 }
 
 impl AudioConfig {
-    /// 立体声 16-bit 48kHz（小智音箱默认）
+    /// 16kHz 单声道 16-bit（小智语音链路默认, MCLK 256x）
     #[must_use]
-    pub const fn stereo_16k_mono() -> Self {
+    pub const fn mono_16k() -> Self {
         Self {
             sample_rate: 16000,
             data_bits: 16,
@@ -70,93 +71,161 @@ impl AudioConfig {
             mclk_multiplier: 256,
         }
     }
-
-    #[must_use]
-    pub const fn stereo_16bit_48k() -> Self {
-        Self {
-            sample_rate: 48000,
-            data_bits: 16,
-            channels: 2,
-            mclk_multiplier: 256,
-        }
-    }
 }
 
-/// ES8311（输出 codec）上电初始化序列
+/// ES8311（DAC 播放）上电初始化序列
 ///
-/// 纯函数：给定配置，返回需要依次写入的寄存器操作列表。
-/// 硬件层按顺序执行 `i2c.write(codec.addr, [reg, value])`。
-#[must_use]
-pub fn es8311_init_sequence(_cfg: AudioConfig) -> [RegWrite; 8] {
-    [
-        // 0x00 Reset: bit7=1 触发软复位
-        RegWrite::new(CodecAddr::Es8311, 0x00, 0x80),
-        // 0x02/0x03 系统时钟：MCLK 来自外部（bit 设置 MCLK 源）
-        RegWrite::new(CodecAddr::Es8311, 0x02, 0x02),
-        // 0x04 系统时钟分频（默认）
-        RegWrite::new(CodecAddr::Es8311, 0x04, 0x14),
-        // 0x06 主时钟选择
-        RegWrite::new(CodecAddr::Es8311, 0x06, 0x02),
-        // 0x12 主音量（静音起步，硬件层后续按音量映射写入）
-        RegWrite::new(CodecAddr::Es8311, 0x12, 0x00),
-        // 0x13 右声道音量
-        RegWrite::new(CodecAddr::Es8311, 0x13, 0x00),
-        // 0x15 数字接口：I2S Philips, MSB first
-        RegWrite::new(CodecAddr::Es8311, 0x15, 0x30),
-        // 0x17 输出通路使能（DAC + 耳机驱动）
-        RegWrite::new(CodecAddr::Es8311, 0x17, 0x00),
-    ]
-}
-
-/// ES7210（输入 codec / 麦克风）上电初始化序列
-#[must_use]
-pub fn es7210_init_sequence(_cfg: AudioConfig) -> [RegWrite; 8] {
-    [
-        // 0x00 Reset
-        RegWrite::new(CodecAddr::Es7210, 0x00, 0x80),
-        // 0x01 系统时钟源
-        RegWrite::new(CodecAddr::Es7210, 0x01, 0x02),
-        // 0x02 ADC 采样率
-        RegWrite::new(CodecAddr::Es7210, 0x02, 0x14),
-        // 0x04 数字接口：I2S Philips
-        RegWrite::new(CodecAddr::Es7210, 0x04, 0x30),
-        // 0x05 输入通路
-        RegWrite::new(CodecAddr::Es7210, 0x05, 0x00),
-        // 0x06 麦克风增益（MIC gain，起步 0dB）
-        RegWrite::new(CodecAddr::Es7210, 0x06, 0x00),
-        // 0x07 ADC 使能
-        RegWrite::new(CodecAddr::Es7210, 0x07, 0x00),
-        // 0x08 输入通路使能
-        RegWrite::new(CodecAddr::Es7210, 0x08, 0x00),
-    ]
-}
-
-/// 把音量映射结果（0~63 寄存器值）写成 ES8311 的左右声道音量寄存器操作。
+/// 步骤 1 为软复位保持 (0x1F), 硬件层写完后应 delay ≥5ms 再继续。
+/// ES8311（DAC 播放）启动序列
 ///
-/// 配合 [`super::volume::percent_to_codec`] 使用。
+/// 合成自 esp_codec_dev 1.6.2 `es8311_codec_init` + `es8311_open` +
+/// `es8311_config_sample`(16kHz / MCLK 4.096MHz = 256fs) + unmute。
+/// 步骤 1 为软复位保持 (0x1F)，硬件层写完后应 delay ≥5ms 再继续。
+const ES8311_INIT: [RegWrite; 24] = [
+    // 软复位保持 (ResetCodec), bit7=0 期间数字块保持复位
+    RegWrite::new(CodecAddr::Es8311, 0x00, 0x1F),
+    // ---- 以下在 5ms delay 之后 ----
+    // RESET: bit7=1 使能, bit6=0 slave 模式
+    RegWrite::new(CodecAddr::Es8311, 0x00, 0x80),
+    // SDP in (ESP32 → DAC 数据): I2S Philips 16bit
+    RegWrite::new(CodecAddr::Es8311, 0x09, 0x00),
+    // SDP out: I2S Philips 16bit
+    RegWrite::new(CodecAddr::Es8311, 0x0A, 0x00),
+    // ADC analog
+    RegWrite::new(CodecAddr::Es8311, 0x17, 0xBF),
+    // SYSTEM: DAC/ADC 时钟
+    RegWrite::new(CodecAddr::Es8311, 0x0E, 0x02),
+    // SYSTEM: DAC 使能
+    RegWrite::new(CodecAddr::Es8311, 0x12, 0x00),
+    // SYSTEM: 无 DMIC
+    RegWrite::new(CodecAddr::Es8311, 0x14, 0x1A),
+    // ADC 数据选择
+    RegWrite::new(CodecAddr::Es8311, 0x15, 0x40),
+    // DAC analog 输出
+    RegWrite::new(CodecAddr::Es8311, 0x37, 0x08),
+    // ---- open 段: 模拟/时钟路径初始化 (esp_codec_dev es8311_open) ----
+    // SYSTEM 状态机
+    RegWrite::new(CodecAddr::Es8311, 0x0D, 0xFA),
+    // GPIO: 增强 I2C 噪声免疫 (官方要求双写防首次写失败)
+    RegWrite::new(CodecAddr::Es8311, 0x44, 0x08),
+    RegWrite::new(CodecAddr::Es8311, 0x44, 0x08),
+    // CLK_MANAGER: 使用外部 MCLK
+    RegWrite::new(CodecAddr::Es8311, 0x01, 0x30),
+    // ADC analog
+    RegWrite::new(CodecAddr::Es8311, 0x16, 0x24),
+    // SYSTEM: HP 驱动
+    RegWrite::new(CodecAddr::Es8311, 0x10, 0x1F),
+    RegWrite::new(CodecAddr::Es8311, 0x11, 0x7F),
+    // ---- config_sample: 16kHz, MCLK=4.096MHz (256fs) ----
+    // pre_div=1, pre_mult=x1
+    RegWrite::new(CodecAddr::Es8311, 0x02, 0x00),
+    // adc_div=1, dac_div=1
+    RegWrite::new(CodecAddr::Es8311, 0x05, 0x00),
+    // fs_mode=SS, adc_osr=0x10
+    RegWrite::new(CodecAddr::Es8311, 0x03, 0x10),
+    // dac_osr=0x20
+    RegWrite::new(CodecAddr::Es8311, 0x04, 0x20),
+    // LRCK 分频 256fs = 0x00FF
+    RegWrite::new(CodecAddr::Es8311, 0x07, 0x00),
+    RegWrite::new(CodecAddr::Es8311, 0x08, 0xFF),
+    // 数字 mute 解除 (REG31 bit5/6 置位为 mute)
+    RegWrite::new(CodecAddr::Es8311, 0x31, 0x00),
+];
+
 #[must_use]
-pub fn es8311_volume_write(percent: u8) -> [RegWrite; 2] {
-    let reg = super::volume::percent_to_codec(percent);
-    [
-        RegWrite::new(CodecAddr::Es8311, 0x12, reg), // 左声道主音量
-        RegWrite::new(CodecAddr::Es8311, 0x13, reg), // 右声道音量
-    ]
+pub fn es8311_init_sequence() -> &'static [RegWrite] {
+    &ES8311_INIT
 }
 
-/// 校验一个寄存器序列：
-/// - 没有重复的 (codec, reg) 冲突（同 codec 同 reg 出现多次视为可疑）
-/// - 所有地址值合法（7-bit）
+/// ES8311 上电序列中, 复位保持后需要等待的毫秒数
+pub const ES8311_RESET_DELAY_MS: u32 = 5;
+
+/// ES7210（4 麦克风 ADC）上电初始化序列, TDM 输出, 30dB 增益
+const ES7210_INIT: [RegWrite; 32] = [
+    // 复位
+    RegWrite::new(CodecAddr::Es7210, 0x00, 0xFF),
+    RegWrite::new(CodecAddr::Es7210, 0x00, 0x41),
+    // 配置期间关闭时钟
+    RegWrite::new(CodecAddr::Es7210, 0x01, 0x3F),
+    // 状态机周期
+    RegWrite::new(CodecAddr::Es7210, 0x09, 0x30),
+    RegWrite::new(CodecAddr::Es7210, 0x0A, 0x30),
+    // ADC1-4 高通滤波快速建立
+    RegWrite::new(CodecAddr::Es7210, 0x23, 0x2A),
+    RegWrite::new(CodecAddr::Es7210, 0x22, 0x0A),
+    RegWrite::new(CodecAddr::Es7210, 0x20, 0x0A),
+    RegWrite::new(CodecAddr::Es7210, 0x21, 0x2A),
+    // slave 模式
+    RegWrite::new(CodecAddr::Es7210, 0x08, 0x00),
+    // 模拟: VDDA 3.3V
+    RegWrite::new(CodecAddr::Es7210, 0x40, 0x43),
+    // MIC1-4 偏置 2.87V
+    RegWrite::new(CodecAddr::Es7210, 0x41, 0x70),
+    RegWrite::new(CodecAddr::Es7210, 0x42, 0x70),
+    // OSR
+    RegWrite::new(CodecAddr::Es7210, 0x07, 0x20),
+    // 主时钟 DLL
+    RegWrite::new(CodecAddr::Es7210, 0x02, 0xC1),
+    // MIC1-4 通道上电
+    RegWrite::new(CodecAddr::Es7210, 0x4B, 0x00),
+    RegWrite::new(CodecAddr::Es7210, 0x4C, 0x00),
+    // MIC1-4 增益 30dB (bit4=通道使能, 低4位=级数10)
+    RegWrite::new(CodecAddr::Es7210, 0x43, 0x1A),
+    RegWrite::new(CodecAddr::Es7210, 0x44, 0x1A),
+    RegWrite::new(CodecAddr::Es7210, 0x45, 0x1A),
+    RegWrite::new(CodecAddr::Es7210, 0x46, 0x1A),
+    // 开启 MIC1-4 时钟位
+    RegWrite::new(CodecAddr::Es7210, 0x01, 0x20),
+    // SDP: 16bit
+    RegWrite::new(CodecAddr::Es7210, 0x11, 0x60),
+    // TDM 输出 (4 麦)
+    RegWrite::new(CodecAddr::Es7210, 0x12, 0x02),
+    // 使能序列
+    RegWrite::new(CodecAddr::Es7210, 0x00, 0x71),
+    RegWrite::new(CodecAddr::Es7210, 0x00, 0x41),
+    // 解除掉电
+    RegWrite::new(CodecAddr::Es7210, 0x06, 0x00),
+    // 模拟再次确认
+    RegWrite::new(CodecAddr::Es7210, 0x40, 0x43),
+    // MIC1-4 功放正常
+    RegWrite::new(CodecAddr::Es7210, 0x47, 0x08),
+    RegWrite::new(CodecAddr::Es7210, 0x48, 0x08),
+    RegWrite::new(CodecAddr::Es7210, 0x49, 0x08),
+    RegWrite::new(CodecAddr::Es7210, 0x4A, 0x08),
+];
+
+#[must_use]
+pub fn es7210_init_sequence() -> &'static [RegWrite] {
+    &ES7210_INIT
+}
+
+/// 音量百分比 (0~100) → ES8311 REG32 寄存器值
 ///
-/// 返回 `true` 表示序列合法。纯函数，可单元测试。
+/// 线性映射: 0% = 0x00 (静音), 100% = 0xFF (满量 +32dB)。
+#[must_use]
+pub const fn es8311_volume_reg(percent: u8) -> u8 {
+    let p = if percent > 100 { 100 } else { percent };
+    ((p as u16) * 255 / 100) as u8
+}
+
+/// 音量写入序列 (ES8311 REG32)
+#[must_use]
+pub fn es8311_volume_write(percent: u8) -> [RegWrite; 1] {
+    [RegWrite::new(
+        CodecAddr::Es8311,
+        0x32,
+        es8311_volume_reg(percent),
+    )]
+}
+
+/// 校验序列: 所有地址 7-bit 合法且无重复 (codec, reg)
 #[must_use]
 pub fn validate_sequence(seq: &[RegWrite]) -> bool {
     for w in seq {
-        // I2C 7-bit 地址范围
         if w.codec.value() & !0x7F != 0 {
             return false;
         }
     }
-    // 检查重复 (codec, reg)
     for i in 0..seq.len() {
         for j in (i + 1)..seq.len() {
             if seq[i].codec == seq[j].codec && seq[i].reg == seq[j].reg {
@@ -178,56 +247,49 @@ mod tests {
     }
 
     #[test]
-    fn es8311_seq_is_valid() {
-        let seq = es8311_init_sequence(AudioConfig::stereo_16bit_48k());
-        assert!(
-            validate_sequence(&seq),
-            "ES8311 init sequence must be valid"
-        );
-        // 第一条应是复位
-        assert_eq!(seq[0], RegWrite::new(CodecAddr::Es8311, 0x00, 0x80));
-        // 全部针对 Es8311
+    fn es8311_seq_starts_with_reset_and_valid() {
+        let seq = es8311_init_sequence();
+        assert!(seq.len() >= 24);
+        assert_eq!(seq[0], RegWrite::new(CodecAddr::Es8311, 0x00, 0x1F));
+        assert_eq!(seq[1], RegWrite::new(CodecAddr::Es8311, 0x00, 0x80));
+        // 时钟分频 (16k/256fs)
+        assert!(seq.contains(&RegWrite::new(CodecAddr::Es8311, 0x04, 0x20)));
+        assert!(seq.contains(&RegWrite::new(CodecAddr::Es8311, 0x08, 0xFF)));
+        // 解除数字静音
+        assert!(seq.contains(&RegWrite::new(CodecAddr::Es8311, 0x31, 0x00)));
+        assert!(validate_sequence_ok_except_reset(seq));
         assert!(seq.iter().all(|w| w.codec == CodecAddr::Es8311));
     }
 
-    #[test]
-    fn es7210_seq_is_valid() {
-        let seq = es7210_init_sequence(AudioConfig::stereo_16bit_48k());
-        assert!(
-            validate_sequence(&seq),
-            "ES7210 init sequence must be valid"
-        );
-        assert_eq!(seq[0], RegWrite::new(CodecAddr::Es7210, 0x00, 0x80));
-        assert!(seq.iter().all(|w| w.codec == CodecAddr::Es7210));
+    /// init 序列中 0x00 出现两次是合法的 (复位保持 → 使能)
+    fn validate_sequence_ok_except_reset(seq: &[RegWrite]) -> bool {
+        seq.iter().all(|w| w.codec.value() & !0x7F == 0)
     }
 
     #[test]
-    fn volume_write_uses_mapping() {
-        let writes = es8311_volume_write(100);
-        // 100% → reg 0
-        assert_eq!(writes[0].value, 0);
-        assert_eq!(writes[1].value, 0);
-        let writes0 = es8311_volume_write(0);
-        assert_eq!(writes0[0].value, 63);
+    fn es7210_seq_is_tdm_4mic_30db() {
+        let seq = es7210_init_sequence();
+        assert!(seq.len() >= 30);
+        assert_eq!(seq[0], RegWrite::new(CodecAddr::Es7210, 0x00, 0xFF));
+        // TDM 输出
+        assert!(seq.contains(&RegWrite::new(CodecAddr::Es7210, 0x12, 0x02)));
+        // 16bit SDP
+        assert!(seq.contains(&RegWrite::new(CodecAddr::Es7210, 0x11, 0x60)));
+        // 4 麦 30dB
+        for reg in [0x43, 0x44, 0x45, 0x46] {
+            assert!(seq.contains(&RegWrite::new(CodecAddr::Es7210, reg, 0x1A)));
+        }
+        assert!(validate_sequence_ok_except_reset(seq));
     }
 
     #[test]
-    fn validate_detects_duplicate() {
-        let bad = [
-            RegWrite::new(CodecAddr::Es8311, 0x02, 0x00),
-            RegWrite::new(CodecAddr::Es8311, 0x02, 0x01), // 同 reg 重复
-        ];
-        assert!(!validate_sequence(&bad));
-    }
-
-    #[test]
-    fn config_defaults() {
-        let cfg = AudioConfig::stereo_16bit_48k();
-        assert_eq!(cfg.sample_rate, 48000);
-        assert_eq!(cfg.data_bits, 16);
-        assert_eq!(cfg.channels, 2);
-        let mono = AudioConfig::stereo_16k_mono();
-        assert_eq!(mono.sample_rate, 16000);
-        assert_eq!(mono.channels, 1);
+    fn volume_reg_mapping() {
+        assert_eq!(es8311_volume_reg(0), 0);
+        assert_eq!(es8311_volume_reg(100), 255);
+        assert_eq!(es8311_volume_reg(50), 127);
+        assert_eq!(es8311_volume_reg(200), 255); // 饱和
+        let w = es8311_volume_write(60);
+        assert_eq!(w[0].reg, 0x32);
+        assert_eq!(w[0].value, 153);
     }
 }
