@@ -75,59 +75,61 @@ impl AudioConfig {
 
 /// ES8311（DAC 播放）上电初始化序列
 ///
-/// 步骤 1 为软复位保持 (0x1F), 硬件层写完后应 delay ≥5ms 再继续。
-/// ES8311（DAC 播放）启动序列
-///
-/// 合成自 esp_codec_dev 1.6.2 `es8311_codec_init` + `es8311_open` +
-/// `es8311_config_sample`(16kHz / MCLK 4.096MHz = 256fs) + unmute。
+/// 合成自 esp_codec_dev 1.6.2 `es8311_open` + `es8311_start`(模拟上电,
+/// REG0D=0x01) + `es8311_config_sample`(16kHz / MCLK 4.096MHz = 256fs) + unmute。
 /// 步骤 1 为软复位保持 (0x1F)，硬件层写完后应 delay ≥5ms 再继续。
-const ES8311_INIT: [RegWrite; 24] = [
+const ES8311_INIT: [RegWrite; 28] = [
     // 软复位保持 (ResetCodec), bit7=0 期间数字块保持复位
     RegWrite::new(CodecAddr::Es8311, 0x00, 0x1F),
     // ---- 以下在 5ms delay 之后 ----
-    // RESET: bit7=1 使能, bit6=0 slave 模式
+    // RESET: bit7=1 退出复位, bit6=0 slave 模式
     RegWrite::new(CodecAddr::Es8311, 0x00, 0x80),
-    // SDP in (ESP32 → DAC 数据): I2S Philips 16bit
-    RegWrite::new(CodecAddr::Es8311, 0x09, 0x00),
-    // SDP out: I2S Philips 16bit
-    RegWrite::new(CodecAddr::Es8311, 0x0A, 0x00),
-    // ADC analog
-    RegWrite::new(CodecAddr::Es8311, 0x17, 0xBF),
-    // SYSTEM: DAC/ADC 时钟
-    RegWrite::new(CodecAddr::Es8311, 0x0E, 0x02),
-    // SYSTEM: DAC 使能
-    RegWrite::new(CodecAddr::Es8311, 0x12, 0x00),
-    // SYSTEM: 无 DMIC
-    RegWrite::new(CodecAddr::Es8311, 0x14, 0x1A),
-    // ADC 数据选择
-    RegWrite::new(CodecAddr::Es8311, 0x15, 0x40),
-    // DAC analog 输出
-    RegWrite::new(CodecAddr::Es8311, 0x37, 0x08),
-    // ---- open 段: 模拟/时钟路径初始化 (esp_codec_dev es8311_open) ----
-    // SYSTEM 状态机
-    RegWrite::new(CodecAddr::Es8311, 0x0D, 0xFA),
-    // GPIO: 增强 I2C 噪声免疫 (官方要求双写防首次写失败)
-    RegWrite::new(CodecAddr::Es8311, 0x44, 0x08),
-    RegWrite::new(CodecAddr::Es8311, 0x44, 0x08),
-    // CLK_MANAGER: 使用外部 MCLK
-    RegWrite::new(CodecAddr::Es8311, 0x01, 0x30),
-    // ADC analog
-    RegWrite::new(CodecAddr::Es8311, 0x16, 0x24),
-    // SYSTEM: HP 驱动
-    RegWrite::new(CodecAddr::Es8311, 0x10, 0x1F),
-    RegWrite::new(CodecAddr::Es8311, 0x11, 0x7F),
+    // CLK_MANAGER: MCLK 直入 + 内部时钟全开 (es8311_open/start 终值, use_mclk)
+    RegWrite::new(CodecAddr::Es8311, 0x01, 0x3F),
     // ---- config_sample: 16kHz, MCLK=4.096MHz (256fs) ----
     // pre_div=1, pre_mult=x1
     RegWrite::new(CodecAddr::Es8311, 0x02, 0x00),
-    // adc_div=1, dac_div=1
-    RegWrite::new(CodecAddr::Es8311, 0x05, 0x00),
     // fs_mode=SS, adc_osr=0x10
     RegWrite::new(CodecAddr::Es8311, 0x03, 0x10),
     // dac_osr=0x20
     RegWrite::new(CodecAddr::Es8311, 0x04, 0x20),
+    // adc_div=1, dac_div=1
+    RegWrite::new(CodecAddr::Es8311, 0x05, 0x00),
     // LRCK 分频 256fs = 0x00FF
     RegWrite::new(CodecAddr::Es8311, 0x07, 0x00),
     RegWrite::new(CodecAddr::Es8311, 0x08, 0xFF),
+    // SYSTEM: 保留默认 (open 段显式清零)
+    RegWrite::new(CodecAddr::Es8311, 0x0B, 0x00),
+    RegWrite::new(CodecAddr::Es8311, 0x0C, 0x00),
+    // SDP in (ESP32 → DAC 数据): I2S Philips 16bit
+    RegWrite::new(CodecAddr::Es8311, 0x09, 0x00),
+    // SDP out: I2S Philips 16bit
+    RegWrite::new(CodecAddr::Es8311, 0x0A, 0x00),
+    // SYSTEM: DAC/ADC 时钟
+    RegWrite::new(CodecAddr::Es8311, 0x0E, 0x02),
+    // SYSTEM: HP 驱动
+    RegWrite::new(CodecAddr::Es8311, 0x10, 0x1F),
+    RegWrite::new(CodecAddr::Es8311, 0x11, 0x7F),
+    // SYSTEM: DAC 使能
+    RegWrite::new(CodecAddr::Es8311, 0x12, 0x00),
+    // SYSTEM (open 段固定 0x10)
+    RegWrite::new(CodecAddr::Es8311, 0x13, 0x10),
+    // SYSTEM: 无 DMIC
+    RegWrite::new(CodecAddr::Es8311, 0x14, 0x1A),
+    // ADC 数据选择
+    RegWrite::new(CodecAddr::Es8311, 0x15, 0x40),
+    // ADC: MIC 增益标度 + analog
+    RegWrite::new(CodecAddr::Es8311, 0x16, 0x24),
+    RegWrite::new(CodecAddr::Es8311, 0x17, 0xBF),
+    // DAC analog 输出
+    RegWrite::new(CodecAddr::Es8311, 0x37, 0x08),
+    // GPIO: 增强 I2C 噪声免疫 (官方要求双写防首次写失败)
+    RegWrite::new(CodecAddr::Es8311, 0x44, 0x08),
+    RegWrite::new(CodecAddr::Es8311, 0x44, 0x08),
+    // GP 控制
+    RegWrite::new(CodecAddr::Es8311, 0x45, 0x00),
+    // SYSTEM: 模拟上电! es8311_start 的 enable 步骤写 0x01; 0xFA/0xFC 为官方掉电态
+    RegWrite::new(CodecAddr::Es8311, 0x0D, 0x01),
     // 数字 mute 解除 (REG31 bit5/6 置位为 mute)
     RegWrite::new(CodecAddr::Es8311, 0x31, 0x00),
 ];
@@ -249,9 +251,16 @@ mod tests {
     #[test]
     fn es8311_seq_starts_with_reset_and_valid() {
         let seq = es8311_init_sequence();
-        assert!(seq.len() >= 24);
+        assert_eq!(seq.len(), 28);
         assert_eq!(seq[0], RegWrite::new(CodecAddr::Es8311, 0x00, 0x1F));
         assert_eq!(seq[1], RegWrite::new(CodecAddr::Es8311, 0x00, 0x80));
+        // 模拟上电: REG0D=0x01 (es8311_start enable); 0xFA/0xFC 是官方掉电态
+        assert!(seq.contains(&RegWrite::new(CodecAddr::Es8311, 0x0D, 0x01)));
+        assert!(!seq.contains(&RegWrite::new(CodecAddr::Es8311, 0x0D, 0xFA)));
+        assert!(!seq.contains(&RegWrite::new(CodecAddr::Es8311, 0x0D, 0xFC)));
+        // 时钟使能终值 (use_mclk) 与 open 段 system 寄存器
+        assert!(seq.contains(&RegWrite::new(CodecAddr::Es8311, 0x01, 0x3F)));
+        assert!(seq.contains(&RegWrite::new(CodecAddr::Es8311, 0x13, 0x10)));
         // 时钟分频 (16k/256fs)
         assert!(seq.contains(&RegWrite::new(CodecAddr::Es8311, 0x04, 0x20)));
         assert!(seq.contains(&RegWrite::new(CodecAddr::Es8311, 0x08, 0xFF)));
