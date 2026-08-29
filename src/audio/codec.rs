@@ -143,7 +143,7 @@ pub fn es8311_init_sequence() -> &'static [RegWrite] {
 pub const ES8311_RESET_DELAY_MS: u32 = 5;
 
 /// ES7210（4 麦克风 ADC）上电初始化序列, TDM 输出, 30dB 增益
-const ES7210_INIT: [RegWrite; 32] = [
+const ES7210_INIT_TDM: [RegWrite; 32] = [
     // 复位
     RegWrite::new(CodecAddr::Es7210, 0x00, 0xFF),
     RegWrite::new(CodecAddr::Es7210, 0x00, 0x41),
@@ -196,9 +196,55 @@ const ES7210_INIT: [RegWrite; 32] = [
     RegWrite::new(CodecAddr::Es7210, 0x4A, 0x08),
 ];
 
+/// ES7210 立体声输出序列 (非 TDM): 与 TDM 序列仅 REG12 不同
+/// (0x00 = 标准 I2S 双通道, MIC1→L / MIC2→R), 其余一致
+const ES7210_INIT_STEREO: [RegWrite; 32] = [
+    RegWrite::new(CodecAddr::Es7210, 0x00, 0xFF),
+    RegWrite::new(CodecAddr::Es7210, 0x00, 0x41),
+    RegWrite::new(CodecAddr::Es7210, 0x01, 0x3F),
+    RegWrite::new(CodecAddr::Es7210, 0x09, 0x30),
+    RegWrite::new(CodecAddr::Es7210, 0x0A, 0x30),
+    RegWrite::new(CodecAddr::Es7210, 0x23, 0x2A),
+    RegWrite::new(CodecAddr::Es7210, 0x22, 0x0A),
+    RegWrite::new(CodecAddr::Es7210, 0x20, 0x0A),
+    RegWrite::new(CodecAddr::Es7210, 0x21, 0x2A),
+    RegWrite::new(CodecAddr::Es7210, 0x08, 0x00),
+    RegWrite::new(CodecAddr::Es7210, 0x40, 0x43),
+    RegWrite::new(CodecAddr::Es7210, 0x41, 0x70),
+    RegWrite::new(CodecAddr::Es7210, 0x42, 0x70),
+    RegWrite::new(CodecAddr::Es7210, 0x07, 0x20),
+    RegWrite::new(CodecAddr::Es7210, 0x02, 0xC1),
+    RegWrite::new(CodecAddr::Es7210, 0x4B, 0x00),
+    RegWrite::new(CodecAddr::Es7210, 0x4C, 0x00),
+    RegWrite::new(CodecAddr::Es7210, 0x43, 0x1A),
+    RegWrite::new(CodecAddr::Es7210, 0x44, 0x1A),
+    RegWrite::new(CodecAddr::Es7210, 0x45, 0x1A),
+    RegWrite::new(CodecAddr::Es7210, 0x46, 0x1A),
+    RegWrite::new(CodecAddr::Es7210, 0x01, 0x20),
+    RegWrite::new(CodecAddr::Es7210, 0x11, 0x60),
+    // 标准 I2S 双通道输出 (无 TDM)
+    RegWrite::new(CodecAddr::Es7210, 0x12, 0x00),
+    RegWrite::new(CodecAddr::Es7210, 0x00, 0x71),
+    RegWrite::new(CodecAddr::Es7210, 0x00, 0x41),
+    RegWrite::new(CodecAddr::Es7210, 0x06, 0x00),
+    RegWrite::new(CodecAddr::Es7210, 0x40, 0x43),
+    RegWrite::new(CodecAddr::Es7210, 0x47, 0x08),
+    RegWrite::new(CodecAddr::Es7210, 0x48, 0x08),
+    RegWrite::new(CodecAddr::Es7210, 0x49, 0x08),
+    RegWrite::new(CodecAddr::Es7210, 0x4A, 0x08),
+];
+
+/// ES7210 上电初始化序列
+///
+/// - `tdm_mode = true`: 4 麦 TDM 输出 (REG12=0x02), 供全双工 AEC 参考通道;
+/// - `tdm_mode = false`: 立体声 I2S 输出 (REG12=0x00, MIC1→L / MIC2→R)。
 #[must_use]
-pub fn es7210_init_sequence() -> &'static [RegWrite] {
-    &ES7210_INIT
+pub fn es7210_init_sequence(tdm_mode: bool) -> &'static [RegWrite] {
+    if tdm_mode {
+        &ES7210_INIT_TDM
+    } else {
+        &ES7210_INIT_STEREO
+    }
 }
 
 /// 音量百分比 (0~100) → ES8311 REG32 寄存器值
@@ -277,7 +323,7 @@ mod tests {
 
     #[test]
     fn es7210_seq_is_tdm_4mic_30db() {
-        let seq = es7210_init_sequence();
+        let seq = es7210_init_sequence(true);
         assert!(seq.len() >= 30);
         assert_eq!(seq[0], RegWrite::new(CodecAddr::Es7210, 0x00, 0xFF));
         // TDM 输出
@@ -289,6 +335,23 @@ mod tests {
             assert!(seq.contains(&RegWrite::new(CodecAddr::Es7210, reg, 0x1A)));
         }
         assert!(validate_sequence_ok_except_reset(seq));
+    }
+
+    #[test]
+    fn es7210_stereo_seq_disables_tdm() {
+        let tdm = es7210_init_sequence(true);
+        let stereo = es7210_init_sequence(false);
+        assert_eq!(stereo.len(), tdm.len());
+        // 仅 REG12 不同: 立体声 0x00, 无 TDM 写入
+        assert!(stereo.contains(&RegWrite::new(CodecAddr::Es7210, 0x12, 0x00)));
+        assert!(!stereo.contains(&RegWrite::new(CodecAddr::Es7210, 0x12, 0x02)));
+        assert!(
+            stereo
+                .iter()
+                .zip(tdm.iter())
+                .all(|(a, b)| a == b || a.reg == 0x12)
+        );
+        assert!(validate_sequence_ok_except_reset(stereo));
     }
 
     #[test]
