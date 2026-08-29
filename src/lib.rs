@@ -14,3 +14,4 @@
 
 pub mod audio;
 pub mod board;
+pub mod dialog;
