@@ -168,9 +168,7 @@ mod tests {
     const FRAME_MS: u64 = 64;
 
     fn step_engine(engine: &mut WakeEngine<VadWakeDetector>, voiced: bool, n: u64) -> WakeEvent {
-        engine
-            .policy_mut()
-            .feed(voiced, n * FRAME_MS)
+        engine.policy_mut().feed(voiced, n * FRAME_MS)
     }
 
     fn make_engine(cfg: WakePolicyConfig) -> WakeEngine<VadWakeDetector> {

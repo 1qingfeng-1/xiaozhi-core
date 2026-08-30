@@ -168,9 +168,9 @@ impl Default for DialogSm {
 #[cfg(test)]
 mod tests {
     extern crate std;
+    use super::*;
     use std::vec;
     use std::vec::Vec;
-    use super::*;
 
     fn actions_of(sm: &mut DialogSm, ev: DialogEvent) -> std::vec::Vec<Action> {
         sm.transition(ev).1.to_vec()
@@ -260,10 +260,7 @@ mod tests {
 
     #[test]
     fn session_closed_from_any_active_state() {
-        for start in [
-            DialogEvent::WakeTriggered,
-            DialogEvent::ManualListenStart,
-        ] {
+        for start in [DialogEvent::WakeTriggered, DialogEvent::ManualListenStart] {
             let mut sm = DialogSm::new();
             actions_of(&mut sm, start);
             actions_of(&mut sm, DialogEvent::SessionReady);

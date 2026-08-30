@@ -15,3 +15,6 @@
 pub mod audio;
 pub mod board;
 pub mod dialog;
+pub mod display;
+pub mod mcp;
+pub mod ota;
