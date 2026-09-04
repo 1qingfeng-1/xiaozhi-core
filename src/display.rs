@@ -62,7 +62,7 @@ pub fn glyph_rows(c: u8) -> Option<[u8; GLYPH_H]> {
 
 /// 文本渲染后的像素尺寸 (宽 = n×3 + (n-1)×1)
 pub fn text_size(text: &str) -> (usize, usize) {
-    let n = text.chars().count() as usize;
+    let n = text.chars().count();
     if n == 0 {
         return (0, 0);
     }
