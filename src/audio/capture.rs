@@ -36,22 +36,46 @@ pub fn apply_gain_percent(samples: &mut [i16], gain_percent: u16) {
     }
 }
 
-/// 能量 VAD: 均方幅度 ≥ `threshold` 视为有声音
+/// 能量 VAD: 去除 DC (帧均值) 后的均方幅度 (RMS) ≥ `threshold` 视为有声音
 ///
+/// 原始采集无高通 (C++ 参考靠 AFE 内 2.8Hz 高通), 故先减帧均值再测能量:
+/// DC 偏置/50Hz 哼声不会顶高能量致假触发 (真机开机假唤醒的根因之一)。
+/// 帧长 ~64ms, 等效高通 ~15Hz, 人声基频 (85Hz+) 不受影响。
 /// 极简实现 (无降噪/频域), 供回环测试与半双工状态机粗判。
 pub fn is_voice_active(samples: &[i16], threshold: i16) -> bool {
     if samples.is_empty() {
         return false;
     }
-    let sum_sq: u64 = samples
+    let n = samples.len() as i64;
+    let sum: i64 = samples.iter().map(|&s| s as i64).sum();
+    let mean = sum / n;
+    let sum_dev_sq: u64 = samples
         .iter()
         .map(|&s| {
-            let v = s as i64;
-            (v * v) as u64
+            let d = (s as i64) - mean;
+            (d * d) as u64
         })
         .sum();
-    let mean_sq = sum_sq / samples.len() as u64;
-    mean_sq >= (threshold as u64) * (threshold as u64)
+    let mean_dev_sq = sum_dev_sq / n as u64;
+    mean_dev_sq >= (threshold as u64) * (threshold as u64)
+}
+
+/// 帧均值 (DC) 与均方幅度 (RMS), 供电平诊断/阈值调参
+pub fn level_stats(samples: &[i16]) -> (i32, i32) {
+    let n = samples.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let sum = samples.iter().map(|&s| s as i32).sum::<i32>();
+    let mean = sum / n as i32;
+    let sum_dev_sq: i64 = samples
+        .iter()
+        .map(|&s| {
+            let d = (s as i64) - mean as i64;
+            d * d
+        })
+        .sum();
+    (mean, (sum_dev_sq / n as i64).isqrt() as i32)
 }
 
 #[cfg(test)]
@@ -123,12 +147,40 @@ mod tests {
         assert_eq!(h, [50, -50]);
     }
 
+    /// 零 DC 交替信号 (前 n 个样本 ±amp, 其余 0)
+    fn alternating(amp: i16, n: usize) -> [i16; 16] {
+        let mut s = [0i16; 16];
+        for (i, v) in s.iter_mut().enumerate().take(n) {
+            *v = if i % 2 == 0 { amp } else { -amp };
+        }
+        s
+    }
+
     #[test]
     fn vad_detects_silence_and_voice() {
         assert!(!is_voice_active(&[], 100));
         assert!(!is_voice_active(&[0, 0, 0], 100));
-        assert!(!is_voice_active(&[10, -10, 10], 100)); // 均方 100 < 100^2
-        assert!(is_voice_active(&[100, -100, 100], 100)); // 均方 100^2
-        assert!(is_voice_active(&[1000; 16], 500));
+        assert!(!is_voice_active(&[10, -10, 10, -10], 100)); // RMS 10 < 100
+        assert!(is_voice_active(&[100, -100, 100, -100], 100)); // RMS 100
+        assert!(is_voice_active(&alternating(1000, 16), 500)); // RMS 1000 > 500
+    }
+
+    #[test]
+    fn vad_ignores_dc_offset() {
+        // 纯 DC: 电平再高无 AC 分量也不触发
+        assert!(!is_voice_active(&[5000; 16], 100));
+        // DC + AC: 去 DC 后 AC 分量仍触发
+        let mut s = [0i16; 16];
+        for (i, v) in s.iter_mut().enumerate() {
+            *v = if i % 2 == 0 { 2000 + 300 } else { 2000 - 300 };
+        }
+        assert!(is_voice_active(&s, 100));
+    }
+
+    #[test]
+    fn level_stats_reports_mean_and_rms() {
+        assert_eq!(level_stats(&[100, -100, 100, -100]), (0, 100));
+        assert_eq!(level_stats(&[1000; 4]), (1000, 0));
+        assert_eq!(level_stats(&[]), (0, 0));
     }
 }
