@@ -36,6 +36,56 @@ pub fn parse_activation_code(body: &str) -> Option<&str> {
     find_str_value(&window[..end], "code")
 }
 
+// e9 固件镜像头校验 (纯逻辑, host 单测)
+//
+// 布局 (对齐 espflash / ESP-IDF 二级 bootloader 镜像, 已用真机镜像逐字节核对):
+// - ImageHeader 24B: magic@0 (0xE9), segment_count@1, flash_mode@2,
+//   flash_config@3, entry@4, ...
+// - 首个 SegmentHeader 8B @24 (addr + length)
+// - AppDescriptor @32: magic_word (0xABCD5432) @32, version (32B) @48,
+//   project_name (32B) @80
+const E9_MAGIC: u8 = 0xE9;
+const APP_DESC_MAGIC: u32 = 0xABCD5432;
+const DESC_VERSION_OFF: usize = 48; // 32 (descriptor 起点) + 16 (magic+secver+reserv1)
+const DESC_NAME_OFF: usize = 80; // 32 + 16 + 32 (version 之后)
+const DESC_STR_LEN: usize = 32;
+
+/// 镜像头解析结果 (NUL 终止, 取到第一个 NUL 为止)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageInfo<'a> {
+    /// 应用版本 (如 "0.1.0")
+    pub version: &'a str,
+    /// 项目名 (如 "xiaozhi-s3")
+    pub project_name: &'a str,
+}
+
+/// 校验 e9 固件镜像头并提取版本/项目名
+///
+/// 需要前 80 字节 (version 字段完整)。`None` 表示不是有效镜像: 长度不足 /
+/// magic 不是 0xE9 / app_desc magic 不符。供下载后先验证再烧写 (防坏固件)。
+pub fn validate_image_header(img: &[u8]) -> Option<ImageInfo<'_>> {
+    if img.len() < DESC_NAME_OFF + DESC_STR_LEN {
+        return None;
+    }
+    if img[0] != E9_MAGIC {
+        return None;
+    }
+    let magic = u32::from_le_bytes([img[32], img[33], img[34], img[35]]);
+    if magic != APP_DESC_MAGIC {
+        return None;
+    }
+    Some(ImageInfo {
+        version: read_cstr(&img[DESC_VERSION_OFF..DESC_VERSION_OFF + DESC_STR_LEN]),
+        project_name: read_cstr(&img[DESC_NAME_OFF..DESC_NAME_OFF + DESC_STR_LEN]),
+    })
+}
+
+/// 取 C 字符串 (到第一个 NUL; 非 UTF-8 返回空串, 不 panic)
+fn read_cstr(buf: &[u8]) -> &str {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    core::str::from_utf8(&buf[..end]).unwrap_or("")
+}
+
 /// 语义化版本比较 (点分十进制, 各段按数值比; 段数不足按 0 补齐)
 ///
 /// 返回 Ordering: `a` 相对 `b` 的大小。非数字段按 0 处理。
@@ -127,5 +177,44 @@ mod tests {
             compare_versions(info.version, older_current),
             Ordering::Greater
         );
+    }
+
+    /// 构造一个最小 e9 镜像头 (24B ImageHeader + 8B SegmentHeader + AppDescriptor)
+    fn make_image(version: &str, name: &str) -> [u8; 112] {
+        let mut img = [0u8; 112];
+        img[0] = E9_MAGIC;
+        img[1] = 5; // segment_count
+        img[2] = 2; // flash_mode
+        // AppDescriptor @32
+        img[32..36].copy_from_slice(&APP_DESC_MAGIC.to_le_bytes());
+        let v = version.as_bytes();
+        img[DESC_VERSION_OFF..DESC_VERSION_OFF + v.len()].copy_from_slice(v);
+        let n = name.as_bytes();
+        img[DESC_NAME_OFF..DESC_NAME_OFF + n.len()].copy_from_slice(n);
+        img
+    }
+
+    #[test]
+    fn validates_e9_header_and_extracts_version() {
+        let img = make_image("1.2.3", "xiaozhi-s3");
+        let info = validate_image_header(&img).unwrap();
+        assert_eq!(info.version, "1.2.3");
+        assert_eq!(info.project_name, "xiaozhi-s3");
+    }
+
+    #[test]
+    fn rejects_bad_magic() {
+        let mut img = make_image("1.2.3", "xiaozhi-s3");
+        img[0] = 0x00;
+        assert_eq!(validate_image_header(&img), None);
+        img[0] = E9_MAGIC;
+        img[32] = 0xff; // 破坏 app_desc magic
+        assert_eq!(validate_image_header(&img), None);
+    }
+
+    #[test]
+    fn rejects_short_image() {
+        assert_eq!(validate_image_header(&[E9_MAGIC; 16]), None);
+        assert_eq!(validate_image_header(&[]), None);
     }
 }
