@@ -3,7 +3,7 @@ edition      = "2024"
 license      = "MIT"
 name         = "xiaozhi-core"
 rust-version = "1.88"
-version      = "0.1.0"
+version = "1.0.0"
 
 # 纯逻辑核心层：no_std 兼容，可在 host (std) 上单元测试。
 # 硬件相关代码（I2S/I2C 寄存器读写、DMA）放在 xiaozhi-s3 固件 crate。
