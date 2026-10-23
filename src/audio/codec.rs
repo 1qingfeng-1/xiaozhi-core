@@ -143,7 +143,7 @@ pub fn es8311_init_sequence() -> &'static [RegWrite] {
 pub const ES8311_RESET_DELAY_MS: u32 = 5;
 
 /// ES7210（4 麦克风 ADC）上电初始化序列, TDM 输出, 30dB 增益
-const ES7210_INIT_TDM: [RegWrite; 32] = [
+const ES7210_INIT_TDM: [RegWrite; 34] = [
     // 复位
     RegWrite::new(CodecAddr::Es7210, 0x00, 0xFF),
     RegWrite::new(CodecAddr::Es7210, 0x00, 0x41),
@@ -157,8 +157,6 @@ const ES7210_INIT_TDM: [RegWrite; 32] = [
     RegWrite::new(CodecAddr::Es7210, 0x22, 0x0A),
     RegWrite::new(CodecAddr::Es7210, 0x20, 0x0A),
     RegWrite::new(CodecAddr::Es7210, 0x21, 0x2A),
-    // slave 模式
-    RegWrite::new(CodecAddr::Es7210, 0x08, 0x00),
     // 模拟: VDDA 3.3V
     RegWrite::new(CodecAddr::Es7210, 0x40, 0x43),
     // MIC1-4 偏置 2.87V
@@ -194,11 +192,16 @@ const ES7210_INIT_TDM: [RegWrite; 32] = [
     RegWrite::new(CodecAddr::Es7210, 0x48, 0x08),
     RegWrite::new(CodecAddr::Es7210, 0x49, 0x08),
     RegWrite::new(CodecAddr::Es7210, 0x4A, 0x08),
+    // 末尾复位脉冲 (对齐 esp_codec_dev `es7210_start` 收尾): 缺此步 ADC
+    // 未进入正常转换节拍, 真机表现为仅 1/16 采样点有数据 (稀疏零)
+    RegWrite::new(CodecAddr::Es7210, 0x40, 0x43),
+    RegWrite::new(CodecAddr::Es7210, 0x00, 0x71),
+    RegWrite::new(CodecAddr::Es7210, 0x00, 0x41),
 ];
 
 /// ES7210 立体声输出序列 (非 TDM): 与 TDM 序列仅 REG12 不同
 /// (0x00 = 标准 I2S 双通道, MIC1→L / MIC2→R), 其余一致
-const ES7210_INIT_STEREO: [RegWrite; 32] = [
+const ES7210_INIT_STEREO: [RegWrite; 34] = [
     RegWrite::new(CodecAddr::Es7210, 0x00, 0xFF),
     RegWrite::new(CodecAddr::Es7210, 0x00, 0x41),
     RegWrite::new(CodecAddr::Es7210, 0x01, 0x3F),
@@ -208,7 +211,6 @@ const ES7210_INIT_STEREO: [RegWrite; 32] = [
     RegWrite::new(CodecAddr::Es7210, 0x22, 0x0A),
     RegWrite::new(CodecAddr::Es7210, 0x20, 0x0A),
     RegWrite::new(CodecAddr::Es7210, 0x21, 0x2A),
-    RegWrite::new(CodecAddr::Es7210, 0x08, 0x00),
     RegWrite::new(CodecAddr::Es7210, 0x40, 0x43),
     RegWrite::new(CodecAddr::Es7210, 0x41, 0x70),
     RegWrite::new(CodecAddr::Es7210, 0x42, 0x70),
@@ -232,6 +234,11 @@ const ES7210_INIT_STEREO: [RegWrite; 32] = [
     RegWrite::new(CodecAddr::Es7210, 0x48, 0x08),
     RegWrite::new(CodecAddr::Es7210, 0x49, 0x08),
     RegWrite::new(CodecAddr::Es7210, 0x4A, 0x08),
+    // 末尾复位脉冲 (对齐 esp_codec_dev `es7210_start` 收尾): 缺此步 ADC
+    // 未进入正常转换节拍, 真机表现为仅 1/16 采样点有数据 (稀疏零)
+    RegWrite::new(CodecAddr::Es7210, 0x40, 0x43),
+    RegWrite::new(CodecAddr::Es7210, 0x00, 0x71),
+    RegWrite::new(CodecAddr::Es7210, 0x00, 0x41),
 ];
 
 /// ES7210 上电初始化序列
