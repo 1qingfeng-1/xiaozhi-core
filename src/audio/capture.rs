@@ -36,6 +36,24 @@ pub fn apply_gain_percent(samples: &mut [i16], gain_percent: u16) {
     }
 }
 
+/// 峰值限幅: 整帧峰值超过 `ceiling` 时按比例缩回 (防削顶失真)
+///
+/// 语音帧的原始峰值动态范围大 (安静句 rms 200 / 峰值 2700+), 固定软件增益
+/// 要么太小声要么削顶。逐帧限幅在保电平的同时避免 i16 饱和 — 削顶会让
+/// 服务端 VAD/ASR 把语音当噪声 (真机 2026-09-26 定位)。
+/// 返回是否发生了限幅 (供诊断)。
+pub fn limit_peak(samples: &mut [i16], ceiling: i16) -> bool {
+    let peak = samples.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0);
+    let ceiling = ceiling.max(1) as i32;
+    if peak <= ceiling {
+        return false;
+    }
+    for s in samples {
+        *s = ((*s as i32) * ceiling / peak) as i16;
+    }
+    true
+}
+
 /// 能量 VAD: 去除 DC (帧均值) 后的均方幅度 (RMS) ≥ `threshold` 视为有声音
 ///
 /// 原始采集无高通 (C++ 参考靠 AFE 内 2.8Hz 高通), 故先减帧均值再测能量:
@@ -182,5 +200,21 @@ mod tests {
         assert_eq!(level_stats(&[100, -100, 100, -100]), (0, 100));
         assert_eq!(level_stats(&[1000; 4]), (1000, 0));
         assert_eq!(level_stats(&[]), (0, 0));
+    }
+
+    #[test]
+    fn limit_peak_scales_without_clipping() {
+        // 未超限: 原样返回, 无限幅
+        let mut s = [100, -200, 300];
+        assert!(!limit_peak(&mut s, 1000));
+        assert_eq!(s, [100, -200, 300]);
+        // 超限: 整帧等比缩到 ceiling, 波形形状保持
+        let mut s = [30000, -15000, 0];
+        assert!(limit_peak(&mut s, 3000));
+        assert_eq!(s, [3000, -1500, 0]);
+        // 负峰更大时也正确
+        let mut s = [100, -32768];
+        assert!(limit_peak(&mut s, 16384));
+        assert_eq!(s, [50, -16384]);
     }
 }
