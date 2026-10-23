@@ -38,6 +38,8 @@ pub enum DialogEvent {
     ManualListenStart,
     /// 松开 BOOT（manual）
     ManualListenStop,
+    /// 自动聆听结束（本地 VAD 检测到持续静音，auto 模式主动收尾）
+    AutoListenStop,
     /// WS 会话就绪（hello 握手完成）
     SessionReady,
     /// 服务器开始语音回复（tts start）
@@ -123,6 +125,9 @@ impl DialogSm {
             // ---- 聆听 ----
             (S::Listening, E::TtsStart) => &[],
             (S::Listening, E::ManualListenStop) => &[SendListenStop],
+            // auto 模式本地 VAD 判定说完: 主动发 listen stop 收尾
+            // (服务端 Silero VAD 对本机上行不敏感, 不主动收尾会一直流)
+            (S::Listening, E::AutoListenStop) => &[SendListenStop],
             // ---- 等待回复 ----
             (S::WaitingReply, E::TtsStart) => &[],
             (S::WaitingReply, E::ManualListenStart) => &[SendListenStart],
@@ -146,6 +151,7 @@ impl DialogSm {
             (S::Connecting, E::SessionClosed | E::ManualListenStop) => S::Idle,
             (S::Listening, E::TtsStart) => S::Speaking,
             (S::Listening, E::ManualListenStop) => S::WaitingReply,
+            (S::Listening, E::AutoListenStop) => S::WaitingReply,
             (S::WaitingReply, E::TtsStart) => S::Speaking,
             (S::WaitingReply, E::ManualListenStart) => S::Listening,
             (S::Speaking, E::TtsStop) if self.mode == ListenMode::Auto => S::Listening,
@@ -202,6 +208,28 @@ mod tests {
         // 断开 → 待机
         actions_of(&mut sm, DialogEvent::SessionClosed);
         assert_eq!(sm.state(), DialogState::Idle);
+    }
+
+    #[test]
+    fn auto_listen_stop_ends_turn_keeps_auto_mode() {
+        let mut sm = DialogSm::new();
+        actions_of(&mut sm, DialogEvent::WakeTriggered);
+        actions_of(&mut sm, DialogEvent::SessionReady);
+        assert_eq!(sm.state(), DialogState::Listening);
+        assert_eq!(sm.mode(), ListenMode::Auto);
+
+        // 本地 VAD 检测到说完: 发 listen stop 进入等回复, 模式仍为 auto
+        let a = actions_of(&mut sm, DialogEvent::AutoListenStop);
+        assert_eq!(a, vec![Action::SendListenStop]);
+        assert_eq!(sm.state(), DialogState::WaitingReply);
+        assert_eq!(sm.mode(), ListenMode::Auto);
+
+        // 回复到达 → 播报; 播完 auto 继续聆听 (连续对话)
+        actions_of(&mut sm, DialogEvent::TtsStart);
+        assert_eq!(sm.state(), DialogState::Speaking);
+        let a = actions_of(&mut sm, DialogEvent::TtsStop);
+        assert_eq!(a, vec![Action::SendListenStart]);
+        assert_eq!(sm.state(), DialogState::Listening);
     }
 
     #[test]
