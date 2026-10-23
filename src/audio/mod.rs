@@ -7,9 +7,11 @@
 //! - 采集处理 (TDM 解包/增益/VAD): [`capture`]
 //! - 音频子系统状态机: [`state`]
 //! - 声音唤醒 (检测器 trait/唤醒策略): [`wake`]
+//! - 播报播放流程 (预缓冲/排空门控): [`playback`]
 
 pub mod capture;
 pub mod codec;
+pub mod playback;
 pub mod sample_rate;
 pub mod state;
 pub mod volume;
