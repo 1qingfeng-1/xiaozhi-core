@@ -23,6 +23,15 @@ impl VadWakeDetector {
     pub fn new(threshold: i16) -> Self {
         Self { threshold }
     }
+
+    /// 动态调整阈值 (环境噪声自适应): 固件按待机噪声底定期更新
+    pub fn set_threshold(&mut self, threshold: i16) {
+        self.threshold = threshold;
+    }
+
+    pub fn threshold(&self) -> i16 {
+        self.threshold
+    }
 }
 
 impl WakeWordSource for VadWakeDetector {
@@ -170,6 +179,10 @@ impl<S: WakeWordSource> WakeEngine<S> {
 
     pub fn policy_mut(&mut self) -> &mut WakePolicy {
         &mut self.policy
+    }
+
+    pub fn source_mut(&mut self) -> &mut S {
+        &mut self.source
     }
 
     pub fn feed(&mut self, pcm: &[i16], now_ms: u64) -> WakeEvent {
