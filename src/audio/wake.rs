@@ -40,6 +40,22 @@ impl WakeWordSource for VadWakeDetector {
     }
 }
 
+/// 噪声底更新: 快降慢升 (安静时快速下调, 说话/瞬态只缓慢抬高)
+pub fn update_noise_floor(ema: i32, rms: i32) -> i32 {
+    if ema == 0 {
+        rms
+    } else if rms < ema {
+        ema - (ema - rms) / 8
+    } else {
+        ema + (rms - ema) / 64
+    }
+}
+
+/// 由噪声底计算唤醒阈值: 2x 噪声 + 150, 限制在 [floor, ceiling]
+pub fn adaptive_threshold(noise_floor: i32, floor: i16, ceiling: i16) -> i16 {
+    (noise_floor * 2 + 150).clamp(floor as i32, ceiling as i32) as i16
+}
+
 /// 唤醒事件
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeEvent {
@@ -327,5 +343,37 @@ mod tests {
         // 预热期结束（n=16 → 1024ms > 1000ms）: 正常去抖，连续 2 帧后触发
         assert_eq!(step_engine(&mut eng, true, 16), WakeEvent::None);
         assert_eq!(step_engine(&mut eng, true, 17), WakeEvent::Triggered);
+    }
+}
+
+#[cfg(test)]
+mod adaptive_tests {
+    use super::*;
+
+    #[test]
+    fn threshold_setter_updates_detection() {
+        let mut det = VadWakeDetector::new(1000);
+        let loud = [500i16, -500, 500, -500];
+        assert!(!det.detect(&loud));
+        det.set_threshold(400);
+        assert_eq!(det.threshold(), 400);
+        assert!(det.detect(&loud));
+    }
+
+    #[test]
+    fn noise_floor_drops_fast_rises_slow() {
+        // 初始值直接采用
+        assert_eq!(update_noise_floor(0, 800), 800);
+        // 变安静: 一次下降 1/8
+        assert_eq!(update_noise_floor(800, 0), 700);
+        // 变吵: 一次上升 1/64
+        assert_eq!(update_noise_floor(700, 1700), 715);
+    }
+
+    #[test]
+    fn adaptive_threshold_clamps_and_scales() {
+        assert_eq!(adaptive_threshold(100, 400, 800), 400);
+        assert_eq!(adaptive_threshold(150, 400, 800), 450);
+        assert_eq!(adaptive_threshold(1000, 400, 800), 800);
     }
 }
