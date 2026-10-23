@@ -40,6 +40,8 @@ pub enum DialogEvent {
     ManualListenStop,
     /// 自动聆听结束（本地 VAD 检测到持续静音，auto 模式主动收尾）
     AutoListenStop,
+    /// 播报中按键打断：立即停止播报并转入自动聆听（后续可直接说话）
+    BargeIn,
     /// WS 会话就绪（hello 握手完成）
     SessionReady,
     /// 服务器开始语音回复（tts start）
@@ -108,7 +110,7 @@ impl DialogSm {
         use DialogState as S;
 
         self.mode = match ev {
-            E::WakeTriggered => ListenMode::Auto,
+            E::WakeTriggered | E::BargeIn => ListenMode::Auto,
             E::ManualListenStart | E::ManualListenStop => ListenMode::Manual,
             _ => self.mode,
         };
@@ -139,6 +141,8 @@ impl DialogSm {
             (S::Speaking, E::TtsStop) => &[],
             // manual 模式播报中按住 BOOT：打断并转入聆听
             (S::Speaking, E::ManualListenStart) => &[SendTtsAbort, SendListenStart],
+            // 播报中按键打断：停止播报并转入 auto 聆听 (可持续语音追问)
+            (S::Speaking, E::BargeIn) => &[SendTtsAbort, SendListenStart],
             // ---- 会话断开 → 待机（Connecting 已单独匹配）----
             (S::Listening | S::Speaking, E::SessionClosed) => &[],
             // ---- 其余事件忽略 ----
@@ -157,6 +161,7 @@ impl DialogSm {
             (S::Speaking, E::TtsStop) if self.mode == ListenMode::Auto => S::Listening,
             (S::Speaking, E::TtsStop) => S::Idle,
             (S::Speaking, E::ManualListenStart) => S::Listening,
+            (S::Speaking, E::BargeIn) => S::Listening,
             (_, E::SessionClosed) => S::Idle,
             _ => self.state,
         };
@@ -316,5 +321,28 @@ mod tests {
         actions_of(&mut sm, DialogEvent::SessionReady);
         assert_eq!(sm.mode(), ListenMode::Manual);
         assert_eq!(sm.state(), DialogState::Listening);
+    }
+}
+
+#[cfg(test)]
+mod barge_in_tests {
+    use super::*;
+
+    #[test]
+    fn barge_in_switches_to_auto_listening() {
+        let mut sm = DialogSm::new();
+        sm.transition(DialogEvent::WakeTriggered);
+        sm.transition(DialogEvent::SessionReady);
+        assert_eq!(sm.state(), DialogState::Listening);
+        let (state, actions) = sm.transition(DialogEvent::TtsStart);
+        assert_eq!(state, DialogState::Speaking);
+        let (state, actions) = sm.transition(DialogEvent::BargeIn);
+        let acts: heapless::Vec<Action, 4> = actions.iter().copied().collect();
+        assert_eq!(state, DialogState::Listening);
+        assert_eq!(sm.mode(), ListenMode::Auto);
+        assert_eq!(
+            acts.as_slice(),
+            &[Action::SendTtsAbort, Action::SendListenStart]
+        );
     }
 }
