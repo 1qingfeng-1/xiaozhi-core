@@ -18,3 +18,4 @@ pub mod dialog;
 pub mod display;
 pub mod mcp;
 pub mod ota;
+pub mod protocol;
