@@ -223,6 +223,17 @@ impl OtaDataEntry {
         self.ota_state == OtaImageState::Valid && self.crc == ota_select_crc(self.ota_seq)
     }
 
+    /// 待确认 = 状态为 PendingVerify 且 crc 匹配 (新镜像首次启动)
+    pub fn is_pending(&self) -> bool {
+        self.ota_state == OtaImageState::PendingVerify && self.crc == ota_select_crc(self.ota_seq)
+    }
+
+    /// 序列标签 (版本串, 截止 NUL)
+    pub fn label_str(&self) -> &str {
+        let n = self.seq_label.iter().position(|&b| b == 0).unwrap_or(20);
+        core::str::from_utf8(&self.seq_label[..n]).unwrap_or("")
+    }
+
     /// 编码为 32B 小端 (字段布局对齐 IDF struct)
     pub fn to_bytes(&self) -> [u8; 32] {
         let mut b = [0u8; 32];
@@ -464,6 +475,17 @@ mod tests {
         // 空输入: init ^ xorout
         assert_eq!(crc32_init_xorout(&[], 0, 0xFFFF_FFFF), 0xFFFF_FFFF);
         assert_eq!(crc32_init_xorout(&[], 0xFFFF_FFFF, 0xFFFF_FFFF), 0);
+    }
+
+    #[test]
+    fn pending_entry_detected() {
+        let e = OtaDataEntry::new(3, "1.1.0", OtaImageState::PendingVerify);
+        assert!(e.is_pending());
+        assert!(!e.is_valid());
+        assert_eq!(e.label_str(), "1.1.0");
+        let mut bad = e;
+        bad.crc ^= 1;
+        assert!(!bad.is_pending());
     }
 
     #[test]
