@@ -1,7 +1,9 @@
-//! 播报播放流程纯逻辑：预缓冲放行与 TtsStop 排空门控
+//! 播报播放流程纯逻辑：预缓冲放行、TtsStop 排空门控、播放时间戳配对
 //!
-//! 固件侧持有 PCM 队列与 I2S DMA；这里只决定「何时开始播」和
-//! 「TtsStop 后何时算排空」，便于在 host 上单测。
+//! 固件侧持有 PCM 队列与 I2S DMA；这里只决定「何时开始播」「TtsStop 后
+//! 何时算排空」以及「哪一帧服务器音频正在出声」，便于在 host 上单测。
+
+use crate::protocol::AecClock;
 
 /// 播放流程状态机
 #[derive(Debug)]
@@ -106,6 +108,87 @@ impl PlaybackFlow {
     }
 }
 
+/// 播放时间戳队列条目: 该帧还有多少字节未播出
+#[derive(Debug, Clone, Copy)]
+struct TsEntry {
+    bytes: usize,
+    ts: u32,
+}
+
+/// 播放时间戳配对 (服务端 AEC)
+///
+/// PCM 入队时登记 `(字节数, 服务器时间戳)`; 每次实际写入 DMA 时按消费
+/// 字节数推进, 一帧**播完**才把时间戳交给 [`AecClock`], 上行帧随之携带
+/// 该时间戳, 服务端即可对齐"正在播放的参考声音"。
+#[derive(Debug)]
+pub struct PlayoutTimestamps {
+    entries: [TsEntry; Self::CAP],
+    head: usize,
+    len: usize,
+}
+
+impl PlayoutTimestamps {
+    /// 队列深度: 每帧一条, 64 条 ≈ 3.8s (60ms/帧) > PCM 队列时长
+    pub const CAP: usize = 64;
+
+    pub fn new() -> Self {
+        Self {
+            entries: [TsEntry { bytes: 0, ts: 0 }; Self::CAP],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    /// 登记一帧 (bytes = 该帧 PCM 字节数; ts = 0 表示无时间戳, 忽略)
+    pub fn push_frame(&mut self, bytes: usize, ts: u32) {
+        if ts == 0 || bytes == 0 {
+            return;
+        }
+        if self.len == Self::CAP {
+            // 满: 并入最早条目 (偏差 < 一帧, 不丢对齐信息)
+            self.entries[self.head].bytes += bytes;
+            return;
+        }
+        let idx = (self.head + self.len) % Self::CAP;
+        self.entries[idx] = TsEntry { bytes, ts };
+        self.len += 1;
+    }
+
+    /// 已播出 `bytes` 字节: 播完的条目按序交给 `clock`
+    pub fn consume(&mut self, mut bytes: usize, clock: &mut AecClock) {
+        while bytes > 0 && self.len > 0 {
+            let e = &mut self.entries[self.head];
+            let take = e.bytes.min(bytes);
+            e.bytes -= take;
+            bytes -= take;
+            if e.bytes == 0 {
+                clock.push(e.ts);
+                self.head = (self.head + 1) % Self::CAP;
+                self.len -= 1;
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+}
+
+impl Default for PlayoutTimestamps {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +260,54 @@ mod tests {
         assert!(!f.is_prebuffering());
         assert!(!f.pending_stop());
         assert!(!f.take_prebuffer_done());
+    }
+
+    #[test]
+    fn playout_ts_fires_only_after_frame_fully_played() {
+        let mut q = PlayoutTimestamps::new();
+        let mut clock = AecClock::new();
+        q.push_frame(100, 11);
+        q.push_frame(100, 22);
+        q.push_frame(100, 33);
+        assert_eq!(q.len(), 3);
+        // 播了半帧: 不应产生时间戳
+        q.consume(50, &mut clock);
+        assert!(clock.is_empty());
+        // 播完第一帧
+        q.consume(50, &mut clock);
+        assert_eq!(clock.pop(), 11);
+        assert!(clock.is_empty());
+        // 一次播完剩余两帧
+        q.consume(200, &mut clock);
+        assert_eq!(clock.pop(), 22);
+        assert_eq!(clock.pop(), 33);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn playout_ts_ignores_zero_and_merges_when_full() {
+        let mut q = PlayoutTimestamps::new();
+        q.push_frame(100, 0);
+        assert!(q.is_empty());
+        for i in 1..=PlayoutTimestamps::CAP as u32 + 2 {
+            q.push_frame(10, i);
+        }
+        assert_eq!(q.len(), PlayoutTimestamps::CAP);
+        // 溢出并入队首: 首帧字节数变大, 时间戳仍为 1
+        let mut clock = AecClock::new();
+        q.consume(10, &mut clock);
+        assert!(clock.is_empty());
+        q.consume(20, &mut clock);
+        assert_eq!(clock.pop(), 1);
+    }
+
+    #[test]
+    fn playout_ts_clear_resets() {
+        let mut q = PlayoutTimestamps::new();
+        q.push_frame(10, 5);
+        q.clear();
+        let mut clock = AecClock::new();
+        q.consume(10, &mut clock);
+        assert!(clock.is_empty());
     }
 }

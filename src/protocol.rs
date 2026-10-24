@@ -156,6 +156,20 @@ pub fn hello_message(version: u16) -> heapless::String<320> {
     s
 }
 
+/// 构造 MQTT 通道的 hello 消息 (transport=udp, 版本固定 3)
+///
+/// MQTT 网关只接受 version 3; 音频走 UDP + AES-128-CTR, 时间戳随帧头
+/// 传给服务端做 AEC, 因此 `features.aec` 恒为 true。
+pub fn udp_hello_message() -> heapless::String<320> {
+    heapless::String::try_from(
+        "{\"type\":\"hello\",\"version\":3,\"transport\":\"udp\",\
+         \"features\":{\"aec\":true,\"mcp\":true},\
+         \"audio_params\":{\"format\":\"opus\",\"sample_rate\":16000,\
+         \"channels\":1,\"frame_duration\":60}}",
+    )
+    .unwrap_or_default()
+}
+
 /// 下行/上行帧时间戳配对队列 (服务端 AEC)
 ///
 /// 每播放一帧下行音频压入其时间戳, 每发一帧上行音频弹出队首。队列满时
@@ -321,6 +335,16 @@ mod tests {
         assert_eq!(clamp_version(0), 1);
         assert_eq!(clamp_version(3), 3);
         assert_eq!(clamp_version(99), 3);
+    }
+
+    #[test]
+    fn udp_hello_is_version3_transport_udp_with_aec() {
+        let s = udp_hello_message();
+        assert!(s.contains("\"version\":3"));
+        assert!(s.contains("\"transport\":\"udp\""));
+        assert!(s.contains("\"aec\":true"));
+        assert!(s.contains("\"mcp\":true"));
+        assert_eq!(s.matches('{').count(), s.matches('}').count());
     }
 
     #[test]
