@@ -129,6 +129,33 @@ pub fn decode_v3(buf: &[u8]) -> Result<FrameV3<'_>, FrameError> {
     })
 }
 
+/// 允许的协议版本范围
+pub const VERSION_MIN: u16 = 1;
+pub const VERSION_MAX: u16 = 3;
+
+/// 把任意版本号收敛到支持范围
+pub fn clamp_version(version: u16) -> u16 {
+    version.clamp(VERSION_MIN, VERSION_MAX)
+}
+
+/// 构造 WebSocket hello 消息
+///
+/// `features.mcp` 宣告 MCP 设备控制; 版本 ≥2 时额外置 `features.aec` —
+/// 表明上行帧携带时间戳, 服务端可据此做回声消除。
+pub fn hello_message(version: u16) -> heapless::String<320> {
+    use core::fmt::Write as _;
+    let version = clamp_version(version);
+    let mut s = heapless::String::new();
+    let _ = write!(
+        s,
+        "{{\"type\":\"hello\",\"version\":{version},\"features\":{{\"mcp\":true\
+         {}}},\"transport\":\"websocket\",\"audio_params\":{{\"format\":\"opus\",\
+         \"sample_rate\":16000,\"channels\":1,\"frame_duration\":60}}}}",
+        if version >= 2 { ",\"aec\":true" } else { "" }
+    );
+    s
+}
+
 /// 下行/上行帧时间戳配对队列 (服务端 AEC)
 ///
 /// 每播放一帧下行音频压入其时间戳, 每发一帧上行音频弹出队首。队列满时
@@ -270,6 +297,30 @@ mod tests {
         let mut bad = out;
         bad[3] = 9;
         assert_eq!(decode_v3(&bad), Err(FrameError::SizeMismatch));
+    }
+
+    #[test]
+    fn hello_v1_has_mcp_but_no_aec() {
+        let s = hello_message(1);
+        assert!(s.starts_with("{\"type\":\"hello\",\"version\":1"));
+        assert!(s.contains("\"mcp\":true"));
+        assert!(!s.contains("aec"));
+        assert!(s.contains("\"transport\":\"websocket\""));
+        assert!(s.contains("\"sample_rate\":16000"));
+        assert_eq!(s.matches('{').count(), s.matches('}').count());
+    }
+
+    #[test]
+    fn hello_v2_advertises_server_aec_and_clamps_version() {
+        let s = hello_message(2);
+        assert!(s.contains("\"version\":2"));
+        assert!(s.contains("\"aec\":true"));
+        assert_eq!(s.matches('{').count(), s.matches('}').count());
+        // 超范围版本收敛到 3
+        assert!(hello_message(9).contains("\"version\":3"));
+        assert_eq!(clamp_version(0), 1);
+        assert_eq!(clamp_version(3), 3);
+        assert_eq!(clamp_version(99), 3);
     }
 
     #[test]
