@@ -109,6 +109,9 @@ pub fn tools_list_response(id: i64) -> heapless::String<RESP_MAX> {
         r#""inputSchema":{"type":"object","properties":{"volume":{"type":"integer","minimum":0,"maximum":100}},"required":["volume"]}},"#,
         r#"{"name":"self.get_system_info","#,
         r#""description":"Get firmware version, uptime, volume, battery level and charging state.","#,
+        r#""inputSchema":{"type":"object","properties":{}}},"#,
+        r#"{"name":"self.reboot","#,
+        r#""description":"Reboot the device. Use only after confirming with the user.","#,
         r#""inputSchema":{"type":"object","properties":{}}}"#,
         r#"]}"#,
     );
