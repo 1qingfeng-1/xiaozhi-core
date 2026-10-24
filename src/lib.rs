@@ -12,10 +12,13 @@
 #![no_std]
 #![deny(unsafe_code)]
 
+pub mod aes;
 pub mod audio;
 pub mod board;
 pub mod dialog;
 pub mod display;
 pub mod mcp;
+pub mod mqtt;
 pub mod ota;
 pub mod protocol;
+pub mod udp;

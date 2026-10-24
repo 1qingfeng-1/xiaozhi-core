@@ -42,6 +42,37 @@ pub fn parse_activation_code(body: &str) -> Option<&str> {
     find_str_value(&window[..end], "code")
 }
 
+/// OTA 清单下发的 MQTT 网关配置 (存在时设备改走 MQTT+UDP 传输)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MqttConfig<'a> {
+    /// `host:port` (网关同时是 MQTT broker 与 UDP 服务端)
+    pub endpoint: &'a str,
+    /// `GID_<model>@@@<mac>@@@<uuid>`
+    pub client_id: &'a str,
+    pub username: &'a str,
+    pub password: &'a str,
+    pub publish_topic: &'a str,
+    pub subscribe_topic: &'a str,
+}
+
+/// 解析 OTA 清单中的 `mqtt` 对象; 未配置网关时返回 None (继续走 WebSocket)
+pub fn parse_mqtt_config(body: &str) -> Option<MqttConfig<'_>> {
+    let pat = "\"mqtt\":";
+    let idx = body.find(pat)? + pat.len();
+    let window = body[idx..].trim_start();
+    let window = window.strip_prefix('{')?;
+    let end = window.find('}')?;
+    let window = &window[..end];
+    Some(MqttConfig {
+        endpoint: find_str_value(window, "endpoint")?,
+        client_id: find_str_value(window, "client_id")?,
+        username: find_str_value(window, "username")?,
+        password: find_str_value(window, "password").unwrap_or(""),
+        publish_topic: find_str_value(window, "publish_topic")?,
+        subscribe_topic: find_str_value(window, "subscribe_topic")?,
+    })
+}
+
 // e9 固件镜像头校验 (纯逻辑, host 单测)
 //
 // 布局 (对齐 espflash / ESP-IDF 二级 bootloader 镜像, 已用真机镜像逐字节核对):
@@ -390,6 +421,34 @@ mod tests {
     #[test]
     fn activation_code_parsed() {
         assert_eq!(parse_activation_code(MANIFEST), Some("123456"));
+    }
+
+    #[test]
+    fn mqtt_config_parsed_when_gateway_configured() {
+        let body = r#"{
+            "firmware": {"version": "1.0.0", "url": ""},
+            "mqtt": {
+                "endpoint": "192.168.123.14:1883",
+                "client_id": "GID_gezipai@@@44_1B_F6_D9_58_B0@@@44_1B_F6_D9_58_B0",
+                "username": "eyJpcCI6ICIxOTIuMTY4LjEyMy4xNCJ9",
+                "password": "c2lnbmF0dXJl",
+                "publish_topic": "device-server",
+                "subscribe_topic": "devices/p2p/44_1B_F6_D9_58_B0"
+            }
+        }"#;
+        let m = parse_mqtt_config(body).unwrap();
+        assert_eq!(m.endpoint, "192.168.123.14:1883");
+        assert_eq!(m.publish_topic, "device-server");
+        assert_eq!(m.subscribe_topic, "devices/p2p/44_1B_F6_D9_58_B0");
+        assert_eq!(m.password, "c2lnbmF0dXJl");
+    }
+
+    #[test]
+    fn mqtt_config_absent_returns_none() {
+        assert_eq!(parse_mqtt_config(MANIFEST), None);
+        assert_eq!(parse_mqtt_config("not json"), None);
+        // mqtt 对象缺少必要字段
+        assert_eq!(parse_mqtt_config(r#"{"mqtt":{"endpoint":"h:1883"}}"#), None);
     }
 
     #[test]
