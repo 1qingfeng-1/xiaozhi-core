@@ -17,6 +17,7 @@ pub mod audio;
 pub mod board;
 pub mod dialog;
 pub mod display;
+pub mod idle;
 pub mod mcp;
 pub mod mqtt;
 pub mod ota;
