@@ -115,14 +115,40 @@ pub fn tools_list_response(id: i64) -> heapless::String<RESP_MAX> {
 /// tools/call 结果包装: `{"content":[{"type":"text","text":...}]}`
 pub fn text_result_response(id: i64, text: &str) -> heapless::String<RESP_MAX> {
     let mut result = heapless::String::<256>::new();
-    let _ = core::fmt::write(
-        &mut result,
-        format_args!(
-            "{{\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}",
-            text
-        ),
-    );
+    let _ = result.push_str("{\"content\":[{\"type\":\"text\",\"text\":\"");
+    escape_json_into(text, &mut result);
+    let _ = result.push_str("\"}]}");
     result_response(id, result.as_str())
+}
+
+/// 把字符串按 JSON 规则转义后追加 (status_json 等本身是 JSON, 必须转义)
+fn escape_json_into(text: &str, out: &mut heapless::String<256>) {
+    use core::fmt::Write as _;
+    for ch in text.chars() {
+        match ch {
+            '"' => {
+                let _ = out.push_str("\\\"");
+            },
+            '\\' => {
+                let _ = out.push_str("\\\\");
+            },
+            '\n' => {
+                let _ = out.push_str("\\n");
+            },
+            '\r' => {
+                let _ = out.push_str("\\r");
+            },
+            '\t' => {
+                let _ = out.push_str("\\t");
+            },
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            },
+            c => {
+                let _ = out.push(c);
+            },
+        }
+    }
 }
 
 /// 设备状态 JSON (get_device_status 返回值, 形状对齐 C++ WifiBoard)
@@ -245,6 +271,9 @@ mod tests {
     fn text_and_status_results() {
         let r = text_result_response(5, "true");
         assert!(r.contains(r#""content":[{"type":"text","text":"true"}]"#));
+        // JSON 文本必须转义, 否则 status_json 嵌入后非法
+        let r = text_result_response(6, "{\"v\":1}");
+        assert!(r.contains(r#""text":"{\"v\":1}""#));
         let s = status_json(70, Some(50), false);
         assert!(s.contains(r#""volume":70"#));
         assert!(s.contains(r#""level":50"#));

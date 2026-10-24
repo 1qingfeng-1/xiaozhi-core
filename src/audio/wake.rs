@@ -51,9 +51,12 @@ pub fn update_noise_floor(ema: i32, rms: i32) -> i32 {
     }
 }
 
-/// 由噪声底计算唤醒阈值: 2x 噪声 + 150, 限制在 [floor, ceiling]
+/// 由噪声底计算唤醒阈值: 1.5x 噪声 + 100, 限制在 [floor, ceiling]
+///
+/// 相比 2x 更贴近安静房间的说话电平 (噪声 250 → 475), 避免阈值过高
+/// 导致正常说话唤不醒; 噪声大时由 ceiling 兜底。
 pub fn adaptive_threshold(noise_floor: i32, floor: i16, ceiling: i16) -> i16 {
-    (noise_floor * 2 + 150).clamp(floor as i32, ceiling as i32) as i16
+    (noise_floor * 3 / 2 + 100).clamp(floor as i32, ceiling as i32) as i16
 }
 
 /// 唤醒事件
@@ -372,8 +375,8 @@ mod adaptive_tests {
 
     #[test]
     fn adaptive_threshold_clamps_and_scales() {
-        assert_eq!(adaptive_threshold(100, 400, 800), 400);
-        assert_eq!(adaptive_threshold(150, 400, 800), 450);
-        assert_eq!(adaptive_threshold(1000, 400, 800), 800);
+        assert_eq!(adaptive_threshold(100, 400, 700), 400);
+        assert_eq!(adaptive_threshold(250, 400, 700), 475);
+        assert_eq!(adaptive_threshold(1000, 400, 700), 700);
     }
 }

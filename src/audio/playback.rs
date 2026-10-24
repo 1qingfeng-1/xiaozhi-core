@@ -11,6 +11,8 @@ pub struct PlaybackFlow {
     prebuffering: bool,
     pending_stop: bool,
     drain_at: u64,
+    stop_at: u64,
+    stop_started: bool,
     prebuffer_done: bool,
 }
 
@@ -22,6 +24,8 @@ impl PlaybackFlow {
             prebuffering: false,
             pending_stop: false,
             drain_at: 0,
+            stop_at: 0,
+            stop_started: false,
             prebuffer_done: false,
         }
     }
@@ -38,6 +42,8 @@ impl PlaybackFlow {
         self.prebuffering = false;
         self.pending_stop = true;
         self.drain_at = 0;
+        self.stop_at = 0;
+        self.stop_started = false;
     }
 
     /// 当前是否允许播放真实音频（预缓冲期间只补静音）
@@ -67,17 +73,23 @@ impl PlaybackFlow {
         if !self.pending_stop {
             return false;
         }
+        if !self.stop_started {
+            self.stop_started = true;
+            self.stop_at = now_ms;
+        }
+        // 兜底: TX 环形卡死 (DmaError::Late 后 tx_free 恒 0) 时队列永远不空,
+        // 最多等 MAX_DRAIN_MS 就强制结束播报, 防止状态机永久停在 Speaking。
+        let forced = now_ms.saturating_sub(self.stop_at) >= 600;
         if !queue_empty {
             self.drain_at = 0;
-            return false;
-        }
-        if self.drain_at == 0 {
+        } else if self.drain_at == 0 {
             self.drain_at = now_ms + self.drain_ms;
-            return false;
         }
-        if now_ms >= self.drain_at {
+        if forced || (queue_empty && self.drain_at != 0 && now_ms >= self.drain_at) {
             self.pending_stop = false;
             self.drain_at = 0;
+            self.stop_at = 0;
+            self.stop_started = false;
             true
         } else {
             false
@@ -88,6 +100,8 @@ impl PlaybackFlow {
         self.prebuffering = false;
         self.pending_stop = false;
         self.drain_at = 0;
+        self.stop_at = 0;
+        self.stop_started = false;
         self.prebuffer_done = false;
     }
 }
@@ -124,10 +138,10 @@ mod tests {
         assert!(f.pending_stop());
         // 队列非空：不计时
         assert!(!f.poll_drained(false, 0));
-        // 队列空：从现在起等 150ms
-        assert!(!f.poll_drained(true, 1000));
-        assert!(!f.poll_drained(true, 1149));
-        assert!(f.poll_drained(true, 1150));
+        // 队列空：从现在起等 150ms (仍在 600ms 兜底内)
+        assert!(!f.poll_drained(true, 100));
+        assert!(!f.poll_drained(true, 249));
+        assert!(f.poll_drained(true, 250));
         assert!(!f.pending_stop());
         assert!(!f.poll_drained(true, 2000));
     }
@@ -142,6 +156,16 @@ mod tests {
         assert!(!f.poll_drained(true, 120));
         assert!(!f.poll_drained(true, 260));
         assert!(f.poll_drained(true, 270));
+    }
+
+    #[test]
+    fn drain_forced_after_max_wait_even_if_queue_not_empty() {
+        let mut f = PlaybackFlow::new(1000, 150);
+        f.on_tts_stop();
+        assert!(!f.poll_drained(false, 0));
+        assert!(!f.poll_drained(false, 599));
+        assert!(f.poll_drained(false, 600));
+        assert!(!f.pending_stop());
     }
 
     #[test]
