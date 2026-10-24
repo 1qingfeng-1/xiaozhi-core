@@ -430,8 +430,8 @@ mod tests {
             "mqtt": {
                 "endpoint": "192.168.123.14:1883",
                 "client_id": "GID_gezipai@@@44_1B_F6_D9_58_B0@@@44_1B_F6_D9_58_B0",
-                "username": "eyJpcCI6ICIxOTIuMTY4LjEyMy4xNCJ9",
-                "password": "c2lnbmF0dXJl",
+                "username": "dXNlcg==",
+                "password": "c2ln",
                 "publish_topic": "device-server",
                 "subscribe_topic": "devices/p2p/44_1B_F6_D9_58_B0"
             }
@@ -440,7 +440,7 @@ mod tests {
         assert_eq!(m.endpoint, "192.168.123.14:1883");
         assert_eq!(m.publish_topic, "device-server");
         assert_eq!(m.subscribe_topic, "devices/p2p/44_1B_F6_D9_58_B0");
-        assert_eq!(m.password, "c2lnbmF0dXJl");
+        assert_eq!(m.password, "c2ln");
     }
 
     #[test]
