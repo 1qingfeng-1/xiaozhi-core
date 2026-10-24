@@ -106,10 +106,36 @@ pub fn tools_list_response(id: i64) -> heapless::String<RESP_MAX> {
         r#""inputSchema":{"type":"object","properties":{}}},"#,
         r#"{"name":"self.audio_speaker.set_volume","#,
         r#""description":"Set the speaker volume (0-100). Call self.get_device_status first if volume is unknown.","#,
-        r#""inputSchema":{"type":"object","properties":{"volume":{"type":"integer","minimum":0,"maximum":100}},"required":["volume"]}}"#,
+        r#""inputSchema":{"type":"object","properties":{"volume":{"type":"integer","minimum":0,"maximum":100}},"required":["volume"]}},"#,
+        r#"{"name":"self.get_system_info","#,
+        r#""description":"Get firmware version, uptime, volume, battery level and charging state.","#,
+        r#""inputSchema":{"type":"object","properties":{}}}"#,
         r#"]}"#,
     );
     result_response(id, TOOLS)
+}
+
+/// 系统信息 JSON (get_system_info 返回值)
+pub fn system_info_json(
+    version: &str,
+    uptime_ms: u64,
+    volume: u8,
+    battery_pct: u8,
+    charging: bool,
+) -> heapless::String<256> {
+    let mut s = heapless::String::<256>::new();
+    let _ = core::fmt::write(
+        &mut s,
+        format_args!(
+            "{{\"version\":\"{}\",\"uptime_s\":{},\"volume\":{},\"battery\":{},\"charging\":{}}}",
+            version,
+            uptime_ms / 1000,
+            volume,
+            battery_pct,
+            charging
+        ),
+    );
+    s
 }
 
 /// tools/call 结果包装: `{"content":[{"type":"text","text":...}]}`
@@ -281,6 +307,11 @@ mod tests {
         let unknown = status_json(10, None, true);
         assert!(unknown.contains(r#""level":-1"#));
         assert!(unknown.contains(r#""charging":true"#));
+        let info = system_info_json("1.0.0", 65_000, 60, 88, false);
+        assert!(info.contains(r#""version":"1.0.0""#));
+        assert!(info.contains(r#""uptime_s":65"#));
+        assert!(info.contains(r#""battery":88"#));
+        assert!(info.contains(r#""charging":false"#));
     }
 
     #[test]
