@@ -130,6 +130,24 @@ fn hex_val(c: u8) -> Option<u8> {
     }
 }
 
+/// 从 `a=1&b=2` 表单查询串取字段
+///
+/// 值做 URL 解码并 trim; 重复键取最后一个 (与配网原实现一致)。
+/// 超长值返回 None (调用方 `unwrap_or_default` 得到空串, 由表单校验拒绝)。
+pub fn form_field<const N: usize>(query: &str, key: &str) -> Option<heapless::String<N>> {
+    let mut found: Option<heapless::String<N>> = None;
+    for pair in query.split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        if k == key {
+            let decoded: heapless::String<64> = url_decode::<64>(v);
+            found = heapless::String::try_from(decoded.as_str().trim()).ok();
+        }
+    }
+    found
+}
+
 /// 解析 `host:port` (MQTT endpoint); 端口必填且 host 非空
 pub fn parse_host_port(s: &str) -> Option<(&str, u16)> {
     let (host, port) = s.rsplit_once(':')?;
@@ -227,6 +245,25 @@ mod tests {
         assert_eq!(url_decode::<2>("abcdef").as_str(), "ab");
         assert_eq!(url_decode::<2>("%E4%B8%AD").as_str(), "");
         assert_eq!(url_decode::<3>("abc").as_str(), "abc");
+    }
+
+    #[test]
+    fn form_field_parses_decodes_and_validates() {
+        let q = "ssid=my+net&pass=p%40ss&server=192.168.1.2";
+        assert_eq!(form_field::<32>(q, "ssid").unwrap().as_str(), "my net");
+        assert_eq!(form_field::<64>(q, "pass").unwrap().as_str(), "p@ss");
+        assert_eq!(
+            form_field::<64>(q, "server").unwrap().as_str(),
+            "192.168.1.2"
+        );
+        assert!(form_field::<64>(q, "missing").is_none());
+        // 无 '=' 的片段跳过; 重复键取最后一个
+        assert_eq!(form_field::<16>("a=1&bad&b=2", "b").unwrap().as_str(), "2");
+        assert_eq!(form_field::<16>("k=1&k=2", "k").unwrap().as_str(), "2");
+        // 超长值视为未提供
+        assert!(form_field::<4>("k=abcdef", "k").is_none());
+        // UTF-8 整体解码
+        assert_eq!(form_field::<16>("k=%E4%B8%AD", "k").unwrap().as_str(), "中");
     }
 
     #[test]

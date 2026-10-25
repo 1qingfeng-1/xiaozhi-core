@@ -63,8 +63,6 @@ pub enum Action {
     SendListenStop,
     /// 发送 tts abort（打断播报）
     SendTtsAbort,
-    /// 播放唤醒提示音
-    PlayWakeChime,
 }
 
 impl Action {
@@ -75,7 +73,6 @@ impl Action {
             Action::SendListenStart => "listen start",
             Action::SendListenStop => "listen stop",
             Action::SendTtsAbort => "tts abort",
-            Action::PlayWakeChime => "唤醒提示音",
         }
     }
 }
@@ -117,7 +114,7 @@ impl DialogSm {
 
         let actions: &[Action] = match (self.state, ev) {
             // ---- 待机 → 建立会话 ----
-            (S::Idle, E::WakeTriggered) => &[PlayWakeChime, ConnectSession],
+            (S::Idle, E::WakeTriggered) => &[ConnectSession],
             (S::Idle, E::ManualListenStart) => &[ConnectSession],
             // ---- 建立中 → 就绪聆听 ----
             (S::Connecting, E::SessionReady) => &[SendListenStart],
@@ -193,7 +190,7 @@ mod tests {
         assert_eq!(sm.state(), DialogState::Idle);
 
         let a = actions_of(&mut sm, DialogEvent::WakeTriggered);
-        assert_eq!(a, vec![Action::PlayWakeChime, Action::ConnectSession]);
+        assert_eq!(a, vec![Action::ConnectSession]);
         assert_eq!(sm.state(), DialogState::Connecting);
         assert_eq!(sm.mode(), ListenMode::Auto);
 
