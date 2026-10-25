@@ -54,6 +54,15 @@ pub fn limit_peak(samples: &mut [i16], ceiling: i16) -> bool {
     true
 }
 
+/// 上行前处理: 软件增益 + 峰值限幅
+///
+/// 返回是否触发限幅。聆听、播报 AEC、预录补发三条上行路径共用同一顺序，
+/// 避免固件侧多处调用时顺序不一致。
+pub fn condition_for_uplink(samples: &mut [i16], gain_percent: u16, ceiling: i16) -> bool {
+    apply_gain_percent(samples, gain_percent);
+    limit_peak(samples, ceiling)
+}
+
 /// 能量 VAD: 去除 DC (帧均值) 后的均方幅度 (RMS) ≥ `threshold` 视为有声音
 ///
 /// 原始采集无高通 (C++ 参考靠 AFE 内 2.8Hz 高通), 故先减帧均值再测能量:
@@ -216,5 +225,18 @@ mod tests {
         let mut s = [100, -32768];
         assert!(limit_peak(&mut s, 16384));
         assert_eq!(s, [50, -16384]);
+    }
+
+    #[test]
+    fn condition_for_uplink_applies_gain_then_limit() {
+        // 150% 增益后峰值为 6000, 超过 ceiling 3000 → 整帧缩放 0.5
+        let mut s = [1000, -1000, 4000, -4000];
+        assert!(condition_for_uplink(&mut s, 150, 3000));
+        assert_eq!(s, [750, -750, 3000, -3000]);
+
+        // 未超限时不缩放, 返回 false
+        let mut s = [1000, -1000];
+        assert!(!condition_for_uplink(&mut s, 150, 3000));
+        assert_eq!(s, [1500, -1500]);
     }
 }
