@@ -4,6 +4,10 @@ license      = "MIT"
 name         = "xiaozhi-core"
 rust-version = "1.88"
 version = "1.0.0"
+description  = "Pure logic core for the xiaozhi-s3 ESP32-S3 speaker firmware"
+repository   = "https://github.com/1qingfeng-1/xiaozhi-core"
+keywords     = ["esp32", "no_std", "xiaozhi", "audio"]
+categories   = ["embedded", "no-std"]
 
 # 纯逻辑核心层：no_std 兼容，可在 host (std) 上单元测试。
 # 硬件相关代码（I2S/I2C 寄存器读写、DMA）放在 xiaozhi-s3 固件 crate。
@@ -19,3 +23,5 @@ version = "1.0.0"
 heapless = "0.8"
 
 [dev-dependencies]
+# 属性测试: 验证解析器对任意输入不 panic / 编解码往返一致
+proptest = "1"
