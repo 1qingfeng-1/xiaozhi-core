@@ -15,6 +15,7 @@
 pub mod aes;
 pub mod audio;
 pub mod board;
+pub mod config_store;
 pub mod dhcp;
 pub mod dialog;
 pub mod display;
