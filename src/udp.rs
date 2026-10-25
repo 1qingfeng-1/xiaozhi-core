@@ -81,6 +81,73 @@ fn hex_val(c: u8) -> Option<u8> {
     }
 }
 
+/// UDP 下行序号判定结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqOutcome {
+    /// 首个包 (无基线)
+    First,
+    /// 紧接上一个包
+    InOrder,
+    /// 中间缺 `missing` 个包
+    Gap { missing: u32 },
+    /// 迟到/重复 (seq 不新于已见最大值)
+    LateOrDup,
+}
+
+/// UDP 下行序号跟踪 (32 位回绕安全)
+///
+/// 只用"序号差"比较, 不依赖绝对大小; 迟到包不会污染后续缺口判断。
+#[derive(Debug, Clone, Copy)]
+pub struct SequenceTracker {
+    have: bool,
+    max: u32,
+}
+
+impl SequenceTracker {
+    pub const fn new() -> Self {
+        Self {
+            have: false,
+            max: 0,
+        }
+    }
+
+    /// 新会话: 清空基线
+    pub fn reset(&mut self) {
+        self.have = false;
+        self.max = 0;
+    }
+
+    /// 已见最大序号 (日志/诊断)
+    pub fn max(&self) -> u32 {
+        self.max
+    }
+
+    /// 观察一个包; `LateOrDup` 不推进基线
+    pub fn observe(&mut self, seq: u32) -> SeqOutcome {
+        if !self.have {
+            self.have = true;
+            self.max = seq;
+            return SeqOutcome::First;
+        }
+        let diff = seq.wrapping_sub(self.max);
+        if diff == 0 || diff >= 0x8000_0000 {
+            return SeqOutcome::LateOrDup;
+        }
+        self.max = seq;
+        if diff == 1 {
+            SeqOutcome::InOrder
+        } else {
+            SeqOutcome::Gap { missing: diff - 1 }
+        }
+    }
+}
+
+impl Default for SequenceTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +191,40 @@ mod tests {
         assert_eq!(v, [0x00, 0xAB, 0x10, 0xFF]);
         assert!(decode_hex::<4>("00ab10f").is_none());
         assert!(decode_hex::<4>("00ab10fg").is_none());
+    }
+
+    #[test]
+    fn sequence_tracker_orders_and_gaps() {
+        let mut t = SequenceTracker::new();
+        assert_eq!(t.observe(100), SeqOutcome::First);
+        assert_eq!(t.observe(101), SeqOutcome::InOrder);
+        assert_eq!(t.observe(105), SeqOutcome::Gap { missing: 3 });
+        assert_eq!(t.max(), 105);
+        // 重复/迟到不推进基线
+        assert_eq!(t.observe(105), SeqOutcome::LateOrDup);
+        assert_eq!(t.observe(104), SeqOutcome::LateOrDup);
+        assert_eq!(t.max(), 105);
+        // 后续正常包继续
+        assert_eq!(t.observe(106), SeqOutcome::InOrder);
+    }
+
+    #[test]
+    fn sequence_tracker_wraps() {
+        let mut t = SequenceTracker::new();
+        assert_eq!(t.observe(u32::MAX - 1), SeqOutcome::First);
+        assert_eq!(t.observe(u32::MAX), SeqOutcome::InOrder);
+        assert_eq!(t.observe(0), SeqOutcome::InOrder); // 回绕到 0
+        assert_eq!(t.observe(1), SeqOutcome::InOrder);
+        assert_eq!(t.observe(u32::MAX), SeqOutcome::LateOrDup);
+    }
+
+    #[test]
+    fn sequence_tracker_resets_and_large_jump() {
+        let mut t = SequenceTracker::new();
+        assert_eq!(t.observe(10), SeqOutcome::First);
+        assert_eq!(t.observe(200), SeqOutcome::Gap { missing: 189 });
+        t.reset();
+        assert_eq!(t.max(), 0);
+        assert_eq!(t.observe(7), SeqOutcome::First);
     }
 }
