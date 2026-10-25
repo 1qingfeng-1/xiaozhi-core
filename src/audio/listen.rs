@@ -9,6 +9,33 @@
 //! - `mic_muted` 阻止"有声"判定 (但不阻止静音累计);
 //! - `in_grace` 同时阻止有声与静音累计 (播报尾音保护)。
 
+use crate::audio::capture::is_voice_active;
+use crate::audio::wake::zero_crossing_permille;
+
+/// 统计一块 PCM 中「人声」子块的累计时长（毫秒）
+///
+/// 子块需同时满足能量 VAD 与 ZCR 上限（人声浊音集中在低频），
+/// 避免键盘敲击/宽带瞬态被计入"说过话"。最后不足一个子块的部分
+/// 按实际长度折算。
+pub fn voiced_ms(
+    samples: &[i16],
+    frame_samples: usize,
+    threshold: i16,
+    max_zcr_permille: u32,
+    sample_rate: u32,
+) -> u64 {
+    if frame_samples == 0 || sample_rate == 0 {
+        return 0;
+    }
+    samples
+        .chunks(frame_samples)
+        .filter(|chunk| {
+            is_voice_active(chunk, threshold) && zero_crossing_permille(chunk) <= max_zcr_permille
+        })
+        .map(|chunk| chunk.len() as u64 * 1000 / sample_rate as u64)
+        .sum()
+}
+
 /// 回合结束参数
 #[derive(Debug, Clone, Copy)]
 pub struct ListenTurnConfig {
@@ -116,9 +143,55 @@ impl Default for ListenTurn {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+    use std::vec::Vec;
 
     const FRAME: u64 = 60;
+    const RATE: u32 = 16_000;
+
+    /// 200Hz 方波 (16kHz 下 80 点/周期), 模拟人声浊音 (低 ZCR)
+    fn speech_like(n: usize, amp: i16) -> Vec<i16> {
+        (0..n)
+            .map(|i| if i % 80 < 40 { amp } else { -amp })
+            .collect()
+    }
+
+    /// 逐点交替 (最高频), 模拟键盘/宽带瞬态 (高 ZCR)
+    fn transient_like(n: usize, amp: i16) -> Vec<i16> {
+        (0..n)
+            .map(|i| if i % 2 == 0 { amp } else { -amp })
+            .collect()
+    }
+
+    #[test]
+    fn voiced_ms_counts_speech_like_chunks() {
+        // 1600 样本 = 960 (60ms) + 640 (40ms), 两段都是人声
+        let pcm = speech_like(1600, 2000);
+        assert_eq!(voiced_ms(&pcm, 960, 300, 250, RATE), 100);
+    }
+
+    #[test]
+    fn voiced_ms_rejects_broadband_transients() {
+        let pcm = transient_like(1600, 2000);
+        assert_eq!(voiced_ms(&pcm, 960, 300, 250, RATE), 0);
+    }
+
+    #[test]
+    fn voiced_ms_mixes_speech_and_transient_chunks() {
+        let mut pcm = speech_like(960, 2000);
+        pcm.extend_from_slice(&transient_like(640, 2000));
+        assert_eq!(voiced_ms(&pcm, 960, 300, 250, RATE), 60);
+    }
+
+    #[test]
+    fn voiced_ms_handles_degenerate_inputs() {
+        let pcm = speech_like(320, 2000);
+        assert_eq!(voiced_ms(&pcm, 0, 300, 250, RATE), 0);
+        assert_eq!(voiced_ms(&pcm, 960, 300, 250, 0), 0);
+        // 不足一个子块也按实际长度折算 (320 样本 = 20ms)
+        assert_eq!(voiced_ms(&pcm, 960, 300, 250, RATE), 20);
+    }
 
     #[test]
     fn speech_then_silence_stops() {
