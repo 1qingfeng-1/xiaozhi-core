@@ -14,14 +14,47 @@ pub trait WakeWordSource {
     fn detect(&mut self, pcm: &[i16]) -> bool;
 }
 
-/// 能量 VAD 检测器：帧均方幅度 ≥ 阈值即命中
+/// 零交叉率上限 (千分比)：人声浊音集中在低频，ZCR 通常 <150‰；
+/// 键盘敲击/摩擦音/宽带噪声接近 400~500‰，用它滤掉瞬态噪声。
+pub const MAX_ZCR_PERMILLE: u32 = 250;
+
+/// 计算去均值后的零交叉率 (千分比, 0~1000)
+pub fn zero_crossing_permille(pcm: &[i16]) -> u32 {
+    if pcm.len() < 2 {
+        return 0;
+    }
+    let sum: i64 = pcm.iter().map(|&s| s as i64).sum();
+    let mean = (sum / pcm.len() as i64) as i32;
+    let mut prev = pcm[0] as i32 - mean;
+    let mut crossings = 0u32;
+    for &s in &pcm[1..] {
+        let v = s as i32 - mean;
+        if (v >= 0) != (prev >= 0) {
+            crossings += 1;
+        }
+        prev = v;
+    }
+    (crossings * 1000 / (pcm.len() as u32 - 1)).min(1000)
+}
+
+/// 能量 VAD 检测器：帧均方幅度 ≥ 阈值，且需要足够多"低零交叉率"的
+/// 人声帧。键盘敲击/宽带瞬态能量足够但 ZCR 高，不会累积到触发门槛；
+/// 说话中的摩擦音偶尔 ZCR 高只做衰减，不会立刻清零。
 pub struct VadWakeDetector {
     threshold: i16,
+    /// 当前有声段内累计的低 ZCR 证据 (0~8)
+    low_zcr_run: u32,
 }
 
 impl VadWakeDetector {
+    /// 触发所需的低 ZCR 证据帧数 (≈180ms 浊音)
+    const LOW_ZCR_REQUIRED: u32 = 3;
+
     pub fn new(threshold: i16) -> Self {
-        Self { threshold }
+        Self {
+            threshold,
+            low_zcr_run: 0,
+        }
     }
 
     /// 动态调整阈值 (环境噪声自适应): 固件按待机噪声底定期更新
@@ -36,7 +69,17 @@ impl VadWakeDetector {
 
 impl WakeWordSource for VadWakeDetector {
     fn detect(&mut self, pcm: &[i16]) -> bool {
-        is_voice_active(pcm, self.threshold)
+        if !is_voice_active(pcm, self.threshold) {
+            self.low_zcr_run = 0;
+            return false;
+        }
+        if zero_crossing_permille(pcm) <= MAX_ZCR_PERMILLE {
+            self.low_zcr_run = (self.low_zcr_run + 1).min(8);
+        } else {
+            // 摩擦音/瞬态: 衰减而不是清零, 容忍正常说话中的高频段
+            self.low_zcr_run = self.low_zcr_run.saturating_sub(1);
+        }
+        self.low_zcr_run >= Self::LOW_ZCR_REQUIRED
     }
 }
 
@@ -224,7 +267,7 @@ mod tests {
         WakeEngine::new(VadWakeDetector::new(300), WakePolicy::new(cfg))
     }
 
-    /// 零 DC 交替信号
+    /// 零 DC 交替信号 (最高频, 模拟键盘/宽带噪声)
     fn alternating(amp: i16) -> [i16; 1024] {
         let mut s = [0i16; 1024];
         for (i, v) in s.iter_mut().enumerate() {
@@ -233,14 +276,56 @@ mod tests {
         s
     }
 
+    /// 低频正弦 (200Hz, 模拟人声浊音)
+    fn sine_200hz(amp: i16) -> [i16; 1024] {
+        let mut s = [0i16; 1024];
+        for (i, v) in s.iter_mut().enumerate() {
+            // 16kHz / 200Hz = 80 点/周期; 用整数相位避免浮点
+            let phase = (i % 80) as i32;
+            *v = if phase < 40 { amp } else { -amp };
+        }
+        s
+    }
+
     #[test]
     fn vad_threshold_levels() {
         let mut det = VadWakeDetector::new(300);
         let quiet = [10i16; 1024]; // 纯 DC, 去 DC 后为静音
-        let loud = alternating(500);
+        let loud = sine_200hz(500);
         assert!(!det.detect(&quiet));
+        // 需要累计 3 帧浊音证据
+        assert!(!det.detect(&loud));
+        assert!(!det.detect(&loud));
         assert!(det.detect(&loud));
         assert!(!det.detect(&[]));
+    }
+
+    #[test]
+    fn zero_crossing_rejects_keyboard_like_noise() {
+        let mut det = VadWakeDetector::new(300);
+        // 人声浊音: 低零交叉率, 累计 3 帧后通过
+        assert!(!det.detect(&sine_200hz(2000)));
+        assert!(!det.detect(&sine_200hz(2000)));
+        assert!(det.detect(&sine_200hz(2000)));
+        // 键盘敲击/宽带瞬态: 能量足够但零交叉率高, 始终拒绝
+        let mut clicks = VadWakeDetector::new(300);
+        for _ in 0..20 {
+            assert!(!clicks.detect(&alternating(2000)));
+        }
+        assert!(zero_crossing_permille(&sine_200hz(2000)) < 100);
+        assert_eq!(zero_crossing_permille(&alternating(2000)), 1000);
+        assert_eq!(zero_crossing_permille(&[7i16; 1024]), 0);
+    }
+
+    #[test]
+    fn short_sibilant_between_vowels_does_not_reset() {
+        let mut det = VadWakeDetector::new(300);
+        assert!(!det.detect(&sine_200hz(2000)));
+        assert!(!det.detect(&sine_200hz(2000)));
+        // 一帧摩擦音只衰减，不清零
+        assert!(!det.detect(&alternating(2000)));
+        assert!(!det.detect(&sine_200hz(2000)));
+        assert!(det.detect(&sine_200hz(2000)));
     }
 
     #[test]
@@ -356,10 +441,17 @@ mod adaptive_tests {
     #[test]
     fn threshold_setter_updates_detection() {
         let mut det = VadWakeDetector::new(1000);
-        let loud = [500i16, -500, 500, -500];
+        // 低频方波 (200Hz): 能量足够且 ZCR 像人声
+        let mut loud = [0i16; 320];
+        for (i, v) in loud.iter_mut().enumerate() {
+            *v = if (i % 80) < 40 { 500 } else { -500 };
+        }
         assert!(!det.detect(&loud));
         det.set_threshold(400);
         assert_eq!(det.threshold(), 400);
+        // 需要累计 3 帧低 ZCR 证据
+        assert!(!det.detect(&loud));
+        assert!(!det.detect(&loud));
         assert!(det.detect(&loud));
     }
 
