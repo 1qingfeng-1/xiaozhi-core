@@ -1,0 +1,21 @@
+# release-plz 配置 (在 xiaozhi-core 仓库根运行)
+#
+# 用法:
+#   cargo install release-plz
+#   release-plz release-pr --git-token "$RELEASE_PLZ_TOKEN"
+#
+# 首次发布前请确认 Cargo.toml 的 version 与 metadata 已就绪。
+
+[workspace]
+# 生成 CHANGELOG 与 release PR
+changelog_update = true
+git_release_enable = true
+# 语义化版本检查 (需要至少一个已发布版本/基线)
+semver_check = true
+# 元数据就绪前先不自动 cargo publish; 准备好后改为 true
+publish = false
+
+[[package]]
+name = "xiaozhi-core"
+changelog_update = true
+git_release_enable = true
