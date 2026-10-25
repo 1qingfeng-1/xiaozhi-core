@@ -191,7 +191,8 @@ fn parse_num(s: &str) -> u64 {
 // 者为活动镜像, slot = (ota_seq - 1) % app_count (我们 app_count=2 →
 // ota_0/ota_1 交替)。无工厂分区且 otadata 全 0xFF 时自愈 (启动 ota_0 并写
 // slot0={seq1,valid})。我们 OTA 时把**更高** seq 写入新 seq 映射的槽 (乒乓),
-// 旧 valid 条目保留作回滚候选; 新条目直接置 VALID (不走 PENDING_VERIFY)。
+// 旧 valid 条目保留作回滚候选; 新条目先置 PENDING_VERIFY, 新镜像启动并
+// 连通 WiFi 后由 confirm_running_image 置 VALID。
 
 /// otadata 未初始化序列号 (擦除态 0xFF)
 pub const UNINITIALIZED_SEQUENCE: u32 = 0xFFFF_FFFF;
@@ -411,7 +412,8 @@ pub fn active_slot(entries: &[OtaDataEntry; 2], app_count: usize) -> Option<usiz
 ///
 /// 对齐 IDF `esp_ota_end`: 新 seq = 活动 seq + 1 (无活动条目时从 1 起);
 /// 目标槽 = `slot_for_seq(新 seq, app_count)` (双 app 乒乓: seq 奇→slot0,
-/// 偶→slot1)。新条目直接置 VALID, 旧 valid 条目保留作回滚候选。
+/// 偶→slot1)。新条目置 PENDING_VERIFY (启动确认后转 VALID), 旧 valid
+/// 条目保留作回滚候选。
 pub fn next_write(entries: &[OtaDataEntry; 2], app_count: usize) -> (u32, usize) {
     let active = active_seq(entries).unwrap_or(0);
     let new_seq = active.saturating_add(1);
