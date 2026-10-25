@@ -19,6 +19,7 @@ pub mod config_store;
 pub mod dhcp;
 pub mod dialog;
 pub mod display;
+pub mod hil;
 pub mod http;
 pub mod idle;
 pub mod json_scan;
