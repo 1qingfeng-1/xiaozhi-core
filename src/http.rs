@@ -86,6 +86,50 @@ pub fn websocket_accept(key: &str) -> heapless::String<32> {
     out
 }
 
+/// URL/form 百分号解码 (`+` → 空格, `%XX` → 字节), 最后统一做 UTF-8 校验
+///
+/// 逐字节解码后再校验, 避免把中文 UTF-8 多字节序列拆成 Latin-1。
+pub fn url_decode<const N: usize>(s: &str) -> heapless::String<N> {
+    let mut bytes: heapless::Vec<u8, N> = heapless::Vec::new();
+    let src = s.as_bytes();
+    let mut i = 0usize;
+    while i < src.len() && !bytes.is_full() {
+        match src[i] {
+            b'+' => {
+                let _ = bytes.push(b' ');
+                i += 1;
+            },
+            b'%' if i + 2 < src.len() => match (hex_val(src[i + 1]), hex_val(src[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    let _ = bytes.push((hi << 4) | lo);
+                    i += 3;
+                },
+                _ => {
+                    let _ = bytes.push(src[i]);
+                    i += 1;
+                },
+            },
+            c => {
+                let _ = bytes.push(c);
+                i += 1;
+            },
+        }
+    }
+    core::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|s| heapless::String::try_from(s).ok())
+        .unwrap_or_default()
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// 解析 `host:port` (MQTT endpoint); 端口必填且 host 非空
 pub fn parse_host_port(s: &str) -> Option<(&str, u16)> {
     let (host, port) = s.rsplit_once(':')?;
@@ -163,6 +207,26 @@ mod tests {
         assert_eq!(header_value(head, "missing"), None);
         // 状态行里的 "101" 不能被当成头
         assert_eq!(header_value(head, "101"), None);
+    }
+
+    #[test]
+    fn url_decode_handles_plus_percent_and_utf8() {
+        assert_eq!(url_decode::<64>("hello+world").as_str(), "hello world");
+        assert_eq!(url_decode::<64>("%41%42%43").as_str(), "ABC");
+        // 中文 UTF-8 必须整体解码, 不能拆成 Latin-1
+        assert_eq!(url_decode::<64>("%E4%B8%AD").as_str(), "中");
+        // 非法百分号按字面保留
+        assert_eq!(url_decode::<64>("a%zzb").as_str(), "a%zzb");
+        // 末尾不完整的 % 也保留
+        assert_eq!(url_decode::<64>("a%4").as_str(), "a%4");
+    }
+
+    #[test]
+    fn url_decode_is_bounded() {
+        // 容量不足时截断; 若截断点落在 UTF-8 中间则返回空串
+        assert_eq!(url_decode::<2>("abcdef").as_str(), "ab");
+        assert_eq!(url_decode::<2>("%E4%B8%AD").as_str(), "");
+        assert_eq!(url_decode::<3>("abc").as_str(), "abc");
     }
 
     #[test]
