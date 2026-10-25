@@ -30,3 +30,4 @@ pub mod server_msg;
 pub mod sha1;
 pub mod sha256;
 pub mod udp;
+pub mod ws;
