@@ -12,6 +12,7 @@ pub mod capture;
 pub mod codec;
 pub mod listen;
 pub mod playback;
+pub mod preroll;
 pub mod sample_rate;
 pub mod volume;
 pub mod wake;
