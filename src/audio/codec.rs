@@ -256,11 +256,12 @@ pub fn es7210_init_sequence(tdm_mode: bool) -> &'static [RegWrite] {
 
 /// 音量百分比 (0~100) → ES8311 REG32 寄存器值
 ///
-/// 线性映射: 0% = 0x00 (静音), 100% = 0xFF (满量 +32dB)。
+/// 0% = 0x00 (静音); 1~100% 映射到 -50dB~-3dB (REG 91~185)。
+/// 100% 不进 +dB 区: 满幅 PCM 叠加 +32dB 会硬削顶 (真机 VOL 100% 破音)。
 #[must_use]
 pub const fn es8311_volume_reg(percent: u8) -> u8 {
-    let p = if percent > 100 { 100 } else { percent };
-    ((p as u16) * 255 / 100) as u8
+    // 唯一映射来源: audio::volume (避免两套互相矛盾的音量换算)
+    crate::audio::volume::percent_to_codec(percent)
 }
 
 /// 音量写入序列 (ES8311 REG32)
@@ -364,11 +365,11 @@ mod tests {
     #[test]
     fn volume_reg_mapping() {
         assert_eq!(es8311_volume_reg(0), 0);
-        assert_eq!(es8311_volume_reg(100), 255);
-        assert_eq!(es8311_volume_reg(50), 127);
-        assert_eq!(es8311_volume_reg(200), 255); // 饱和
+        assert_eq!(es8311_volume_reg(100), 185); // -3dB 上限, 防满幅削顶
+        assert_eq!(es8311_volume_reg(50), 138);
+        assert_eq!(es8311_volume_reg(200), 185); // 饱和
         let w = es8311_volume_write(60);
         assert_eq!(w[0].reg, 0x32);
-        assert_eq!(w[0].value, 153);
+        assert_eq!(w[0].value, 147);
     }
 }

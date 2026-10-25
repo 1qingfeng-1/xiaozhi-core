@@ -105,10 +105,11 @@ mod tests {
     #[test]
     fn glyph_rows_within_bounds() {
         for c in b' '..=b'~' {
-            if let Some(rows) = glyph_rows(c) {
-                for row in rows {
-                    assert!(row <= 0b111, "字形超出 3bit: {} ({})", row, c as char);
-                }
+            let Some(rows) = glyph_rows(c) else {
+                continue;
+            };
+            for row in rows {
+                assert!(row <= 0b111, "字形超出 3bit: {} ({})", row, c as char);
             }
         }
     }

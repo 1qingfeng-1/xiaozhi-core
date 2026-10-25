@@ -56,6 +56,8 @@ pub struct Publish<'a> {
     pub topic: &'a str,
     pub payload: &'a [u8],
     pub qos: u8,
+    /// QoS1/2 的 packet id (QoS0 为 None); QoS1 需回 PUBACK
+    pub packet_id: Option<u16>,
     pub retain: bool,
     pub dup: bool,
 }
@@ -161,6 +163,13 @@ pub fn encode_publish(topic: &str, payload: &[u8], out: &mut [u8]) -> Result<usi
     Ok(total)
 }
 
+/// 编码 QoS1 PUBACK
+pub fn encode_puback(packet_id: u16, out: &mut [u8]) -> Result<usize, MqttError> {
+    let (at, total) = begin_frame(PUBACK << 4, 2, out)?;
+    out[at..at + 2].copy_from_slice(&packet_id.to_be_bytes());
+    Ok(total)
+}
+
 /// 增量解析一个报文
 ///
 /// 返回 `Ok(None)` 表示缓冲里还不够一个完整报文 (调用方继续读 socket)。
@@ -211,16 +220,21 @@ pub fn decode(buf: &[u8]) -> Result<Option<(Packet<'_>, usize)>, MqttError> {
                 core::str::from_utf8(&body[2..2 + topic_len]).map_err(|_| MqttError::BadUtf8)?;
             let qos = (flags >> 1) & 0x03;
             let mut off = 2 + topic_len;
-            if qos > 0 {
+            let packet_id = if qos > 0 {
                 if body.len() < off + 2 {
                     return Err(MqttError::Malformed);
                 }
+                let id = u16::from_be_bytes([body[off], body[off + 1]]);
                 off += 2;
-            }
+                Some(id)
+            } else {
+                None
+            };
             Packet::Publish(Publish {
                 topic,
                 payload: &body[off..],
                 qos,
+                packet_id,
                 retain: flags & 1 != 0,
                 dup: flags & 0x08 != 0,
             })
@@ -355,10 +369,18 @@ mod tests {
             Packet::Publish(p) => {
                 assert_eq!(p.topic, "abc");
                 assert_eq!(p.qos, 1);
+                assert_eq!(p.packet_id, Some(9));
                 assert_eq!(p.payload, &[1, 2, 3, 4]);
             },
             other => panic!("期望 Publish, 实际 {other:?}"),
         }
+    }
+
+    #[test]
+    fn encode_puback_layout() {
+        let mut buf = [0u8; 8];
+        let n = encode_puback(0x1234, &mut buf).unwrap();
+        assert_eq!(&buf[..n], &[0x40, 0x02, 0x12, 0x34]);
     }
 
     #[test]

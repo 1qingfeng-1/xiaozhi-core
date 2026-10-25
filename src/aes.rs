@@ -42,7 +42,6 @@ impl Aes128 {
     pub fn new(key: &[u8; 16]) -> Self {
         let mut round_keys = [0u8; 176];
         round_keys[..16].copy_from_slice(key);
-        let mut rcon_idx = 0usize;
         for round in 1..11 {
             let prev = (round - 1) * 16;
             let cur = round * 16;
@@ -54,9 +53,8 @@ impl Aes128 {
             ];
             // RotWord
             t.rotate_left(1);
-            // SubWord + Rcon
-            let rc = RCON[rcon_idx];
-            rcon_idx += 1;
+            // SubWord + Rcon (轮常量下标 = round - 1)
+            let rc = RCON[round - 1];
             t[0] = SBOX[t[0] as usize] ^ rc;
             t[1] = SBOX[t[1] as usize];
             t[2] = SBOX[t[2] as usize];

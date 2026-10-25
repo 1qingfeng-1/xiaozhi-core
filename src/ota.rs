@@ -15,9 +15,11 @@
 pub struct UpdateInfo<'a> {
     pub version: &'a str,
     pub url: &'a str,
+    /// 可选镜像 SHA-256 (服务端支持时下发; 兼容 `sha256` / `hash` 两种键)
+    pub sha256: Option<&'a str>,
 }
 
-/// 解析 OTA 清单, 提取 firmware.version / firmware.url
+/// 解析 OTA 清单, 提取 firmware.version / firmware.url / 可选 sha256
 pub fn parse_manifest(body: &str) -> Option<UpdateInfo<'_>> {
     // 在 "firmware" 对象内查找两个字段: 取 "firmware":{ 之后到配对大括号前的窗口
     let pat = "\"firmware\":";
@@ -29,7 +31,12 @@ pub fn parse_manifest(body: &str) -> Option<UpdateInfo<'_>> {
 
     let version = find_str_value(window, "version")?;
     let url = find_str_value(window, "url")?;
-    Some(UpdateInfo { version, url })
+    let sha256 = find_str_value(window, "sha256").or_else(|| find_str_value(window, "hash"));
+    Some(UpdateInfo {
+        version,
+        url,
+        sha256,
+    })
 }
 
 /// 解析激活码字段 (C++ 返回的 activation.code, 设备端目前仅日志)
@@ -239,7 +246,12 @@ impl OtaDataEntry {
     pub fn new(ota_seq: u32, seq_label: &str, ota_state: OtaImageState) -> Self {
         let mut label = [0u8; 20];
         let b = seq_label.as_bytes();
-        let n = b.len().min(19);
+        // 按字符边界截断: 切断 UTF-8 会让 label_str() 返回空串,
+        // 导致 confirm_running_image 永远匹配不上 PENDING 条目。
+        let mut n = b.len().min(19);
+        while n > 0 && !seq_label.is_char_boundary(n) {
+            n -= 1;
+        }
         label[..n].copy_from_slice(&b[..n]);
         Self {
             ota_seq,
@@ -375,7 +387,8 @@ pub fn active_seq(entries: &[OtaDataEntry; 2]) -> Option<u32> {
 
 /// 由序列号推 app slot: `(seq - 1) % app_count` (`seq` 必须 ≥1)
 pub fn slot_for_seq(seq: u32, app_count: usize) -> usize {
-    debug_assert!(seq >= 1, "有效 ota_seq 从 1 起");
+    // seq=0 只可能来自被构造/损坏的 otadata; 按 1 处理而不是下溢/调试 panic
+    let seq = seq.max(1);
     ((seq - 1) % app_count as u32) as usize
 }
 
@@ -397,6 +410,7 @@ pub fn next_write(entries: &[OtaDataEntry; 2], app_count: usize) -> (u32, usize)
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use core::cmp::Ordering;
 
@@ -410,6 +424,18 @@ mod tests {
         let info = parse_manifest(MANIFEST).unwrap();
         assert_eq!(info.version, "2.1.0");
         assert_eq!(info.url, "http://192.168.123.14:8003/firmware/xiaozhi.bin");
+    }
+
+    #[test]
+    fn parses_optional_sha256_hash() {
+        const H: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let body =
+            std::format!(r#"{{"firmware":{{"version":"1.0.0","url":"http://x","sha256":"{H}"}}}}"#);
+        assert_eq!(parse_manifest(&body).unwrap().sha256, Some(H));
+        let body =
+            std::format!(r#"{{"firmware":{{"version":"1.0.0","url":"http://x","hash":"{H}"}}}}"#);
+        assert_eq!(parse_manifest(&body).unwrap().sha256, Some(H));
+        assert_eq!(parse_manifest(MANIFEST).unwrap().sha256, None);
     }
 
     #[test]
@@ -626,6 +652,7 @@ mod tests {
         assert_eq!(slot_for_seq(2, 2), 1); // ota_1
         assert_eq!(slot_for_seq(3, 2), 0); // ota_0
         assert_eq!(slot_for_seq(4, 2), 1); // ota_1
+        assert_eq!(slot_for_seq(0, 2), 0); // 损坏的 seq=0 不下溢
     }
 
     #[test]

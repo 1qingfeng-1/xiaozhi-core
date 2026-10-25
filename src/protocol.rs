@@ -151,7 +151,8 @@ pub fn hello_message(version: u16) -> heapless::String<320> {
         "{{\"type\":\"hello\",\"version\":{version},\"features\":{{\"mcp\":true\
          {}}},\"transport\":\"websocket\",\"audio_params\":{{\"format\":\"opus\",\
          \"sample_rate\":16000,\"channels\":1,\"frame_duration\":60}}}}",
-        if version >= 2 { ",\"aec\":true" } else { "" }
+        // v3 头没有 timestamp 字段, 不能宣告 AEC; 只有 v2 携带时间戳
+        if version == 2 { ",\"aec\":true" } else { "" }
     );
     s
 }
@@ -183,8 +184,9 @@ pub struct AecClock {
 }
 
 impl AecClock {
-    /// 深缓冲深度: 播放与上行由不同节奏驱动, 留 8 帧 (≈480ms) 余量
-    pub const CAP: usize = 8;
+    /// 深缓冲深度: 必须覆盖播放队列的 8s (133 帧) 且留余量,
+    /// 否则长应答/静音窗会丢弃旧时间戳, 导致服务端 AEC 参考帧错位。
+    pub const CAP: usize = 192;
 
     pub const fn new() -> Self {
         Self {
@@ -330,8 +332,10 @@ mod tests {
         assert!(s.contains("\"version\":2"));
         assert!(s.contains("\"aec\":true"));
         assert_eq!(s.matches('{').count(), s.matches('}').count());
-        // 超范围版本收敛到 3
-        assert!(hello_message(9).contains("\"version\":3"));
+        // 超范围版本收敛到 3; v3 头无时间戳, 不能宣告 AEC
+        let v3 = hello_message(9);
+        assert!(v3.contains("\"version\":3"));
+        assert!(!v3.contains("\"aec\":true"));
         assert_eq!(clamp_version(0), 1);
         assert_eq!(clamp_version(3), 3);
         assert_eq!(clamp_version(99), 3);
@@ -382,11 +386,11 @@ mod tests {
         }
         assert_eq!(c.pop(), 1);
         assert_eq!(c.pop(), 2);
-        // 回绕写入
-        for i in 5..12u32 {
+        // 回绕写入: 再压入 CAP-1 条, 总长 CAP+2 → 覆盖最旧两条
+        for i in 5..(5 + AecClock::CAP as u32 - 1) {
             c.push(i + 1);
         }
-        assert_eq!(c.len(), 8);
+        assert_eq!(c.len(), AecClock::CAP);
         // 3/4 被后续写入覆盖, 队首为 5
         assert_eq!(c.pop(), 5);
         c.clear();

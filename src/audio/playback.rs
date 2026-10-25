@@ -10,6 +10,8 @@ use crate::protocol::AecClock;
 pub struct PlaybackFlow {
     prebuffer_bytes: usize,
     drain_ms: u64,
+    /// TX DMA 卡死时的兜底上限（必须 ≥ 软件队列时长 + TX 环时长）
+    force_ms: u64,
     prebuffering: bool,
     pending_stop: bool,
     drain_at: u64,
@@ -19,10 +21,13 @@ pub struct PlaybackFlow {
 }
 
 impl PlaybackFlow {
-    pub fn new(prebuffer_bytes: usize, drain_ms: u64) -> Self {
+    /// `drain_ms`: 队列空后等待 DMA 排空的余量（应 ≥ TX 环形时长）
+    /// `force_ms`: TX 卡死兜底上限（应 ≥ 队列容量时长 + TX 环时长 + 余量）
+    pub fn new(prebuffer_bytes: usize, drain_ms: u64, force_ms: u64) -> Self {
         Self {
             prebuffer_bytes,
             drain_ms,
+            force_ms,
             prebuffering: false,
             pending_stop: false,
             drain_at: 0,
@@ -71,6 +76,10 @@ impl PlaybackFlow {
     }
 
     /// 队列空后再等 `drain_ms`，到点返回 true 表示可以派发 TtsStop
+    ///
+    /// 兜底 `force_ms` 只在 TX DMA 真卡死时才有意义：正常路径下软件队列
+    /// 可能仍有 2–3s 音频（服务器合成快于实时），不能用短超时提前结束播报，
+    /// 否则会一边外放一边开麦，形成自问自答。
     pub fn poll_drained(&mut self, queue_empty: bool, now_ms: u64) -> bool {
         if !self.pending_stop {
             return false;
@@ -79,9 +88,7 @@ impl PlaybackFlow {
             self.stop_started = true;
             self.stop_at = now_ms;
         }
-        // 兜底: TX 环形卡死 (DmaError::Late 后 tx_free 恒 0) 时队列永远不空,
-        // 最多等 MAX_DRAIN_MS 就强制结束播报, 防止状态机永久停在 Speaking。
-        let forced = now_ms.saturating_sub(self.stop_at) >= 600;
+        let forced = now_ms.saturating_sub(self.stop_at) >= self.force_ms;
         if !queue_empty {
             self.drain_at = 0;
         } else if self.drain_at == 0 {
@@ -128,8 +135,12 @@ pub struct PlayoutTimestamps {
 }
 
 impl PlayoutTimestamps {
-    /// 队列深度: 每帧一条, 64 条 ≈ 3.8s (60ms/帧) > PCM 队列时长
-    pub const CAP: usize = 64;
+    /// 队列深度: 每帧一条, 192 条 ≈ 11.5s (60ms/帧) > PCM 队列 8s
+    ///
+    /// 必须覆盖整个 PCM 环: 服务端 TTS 快于实时, 队列里可能压着 8s 音频;
+    /// 容量不足时新帧时间戳会被并入最旧条目, 服务端 AEC 参考帧随之错位/
+    /// 丢失 (真机表现为播报中上行时间戳大量为 0, AEC 基本失效)。
+    pub const CAP: usize = 192;
 
     pub fn new() -> Self {
         Self {
@@ -195,7 +206,7 @@ mod tests {
 
     #[test]
     fn prebuffer_blocks_until_threshold() {
-        let mut f = PlaybackFlow::new(1000, 150);
+        let mut f = PlaybackFlow::new(1000, 150, 600);
         f.on_tts_start(0);
         assert!(f.is_prebuffering());
         assert!(!f.allow_audio(999));
@@ -207,7 +218,7 @@ mod tests {
 
     #[test]
     fn tts_start_with_enough_data_skips_prebuffer() {
-        let mut f = PlaybackFlow::new(1000, 150);
+        let mut f = PlaybackFlow::new(1000, 150, 600);
         f.on_tts_start(5000);
         assert!(!f.is_prebuffering());
         assert!(f.allow_audio(5000));
@@ -215,7 +226,7 @@ mod tests {
 
     #[test]
     fn drain_waits_until_queue_empty_plus_delay() {
-        let mut f = PlaybackFlow::new(1000, 150);
+        let mut f = PlaybackFlow::new(1000, 150, 600);
         f.on_tts_start(5000);
         f.on_tts_stop();
         assert!(f.pending_stop());
@@ -231,7 +242,7 @@ mod tests {
 
     #[test]
     fn drain_timer_resets_if_audio_arrives() {
-        let mut f = PlaybackFlow::new(1000, 150);
+        let mut f = PlaybackFlow::new(1000, 150, 600);
         f.on_tts_stop();
         assert!(!f.poll_drained(true, 0));
         // 又有音频入队，计时清零
@@ -243,7 +254,7 @@ mod tests {
 
     #[test]
     fn drain_forced_after_max_wait_even_if_queue_not_empty() {
-        let mut f = PlaybackFlow::new(1000, 150);
+        let mut f = PlaybackFlow::new(1000, 150, 600);
         f.on_tts_stop();
         assert!(!f.poll_drained(false, 0));
         assert!(!f.poll_drained(false, 599));
@@ -252,8 +263,20 @@ mod tests {
     }
 
     #[test]
+    fn long_queue_is_not_cut_short_by_force_timeout() {
+        // 队列里还有 3s 音频时, 兜底阈值必须大于队列时长, 否则会在
+        // 外放未结束时切回 Listening (自问自答的根因)。
+        let mut f = PlaybackFlow::new(1000, 150, 4_000);
+        f.on_tts_stop();
+        assert!(!f.poll_drained(false, 0));
+        assert!(!f.poll_drained(false, 599));
+        assert!(!f.poll_drained(false, 3_999));
+        assert!(f.poll_drained(false, 4_000)); // 仅 TX 卡死时兜底
+    }
+
+    #[test]
     fn reset_clears_all_state() {
-        let mut f = PlaybackFlow::new(1000, 150);
+        let mut f = PlaybackFlow::new(1000, 150, 600);
         f.on_tts_start(0);
         f.on_tts_stop();
         f.reset();

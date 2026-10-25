@@ -334,7 +334,7 @@ mod barge_in_tests {
         sm.transition(DialogEvent::WakeTriggered);
         sm.transition(DialogEvent::SessionReady);
         assert_eq!(sm.state(), DialogState::Listening);
-        let (state, actions) = sm.transition(DialogEvent::TtsStart);
+        let (state, _) = sm.transition(DialogEvent::TtsStart);
         assert_eq!(state, DialogState::Speaking);
         let (state, actions) = sm.transition(DialogEvent::BargeIn);
         let acts: heapless::Vec<Action, 4> = actions.iter().copied().collect();
