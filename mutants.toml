@@ -1,0 +1,17 @@
+# cargo-mutants 配置 (在 xiaozhi-core 目录运行)
+#
+#   cargo install cargo-mutants --locked
+#   cd xiaozhi-core && cargo mutants --test-tool nextest
+#
+# 变异测试用于验证 206 个 host 测试是否真的能发现逻辑错误。
+# 不进入 CI（耗时），建议在改动协议/状态机/OTA 编码后本地跑一次。
+
+[mutants]
+# 与 nextest 配合, 避免 cargo test 的串行开销
+test_tool = "nextest"
+# 超时倍率: 个别测试含 proptest 256 cases
+timeout_multiplier = 2.0
+# fuzz harness 是独立 crate, 不参与变异
+exclude_globs = ["fuzz/**"]
+# 生成摘要, 便于对照
+output = "mutants.out"
