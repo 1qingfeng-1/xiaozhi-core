@@ -19,19 +19,53 @@ pub struct UpdateInfo<'a> {
     pub sha256: Option<&'a str>,
 }
 
+/// 取 `"key": { ... }` 对象窗口 (含大括号), 正确处理字符串内的 `{}` 与转义
+fn object_window<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let mut pat = heapless::String::<40>::new();
+    pat.push('"').ok()?;
+    pat.push_str(key).ok()?;
+    pat.push_str("\":").ok()?;
+    let idx = body.find(pat.as_str())? + pat.len();
+    let rest = body[idx..].trim_start();
+    if !rest.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, &b) in rest.as_bytes().iter().enumerate() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&rest[..=i]);
+                }
+            },
+            _ => {},
+        }
+    }
+    None
+}
+
 /// 解析 OTA 清单, 提取 firmware.version / firmware.url / 可选 sha256
 pub fn parse_manifest(body: &str) -> Option<UpdateInfo<'_>> {
-    // 在 "firmware" 对象内查找两个字段: 取 "firmware":{ 之后到配对大括号前的窗口
-    let pat = "\"firmware\":";
-    let idx = body.find(pat)? + pat.len();
-    let window = body[idx..].trim_start();
-    let window = window.strip_prefix('{')?;
-    let end = window.find('}')?;
-    let window = &window[..end];
-
-    let version = find_str_value(window, "version")?;
-    let url = find_str_value(window, "url")?;
-    let sha256 = find_str_value(window, "sha256").or_else(|| find_str_value(window, "hash"));
+    let window = object_window(body, "firmware")?;
+    let version = crate::server_msg::field(window, "version")?;
+    let url = crate::server_msg::field(window, "url")?;
+    let sha256 = crate::server_msg::field(window, "sha256")
+        .or_else(|| crate::server_msg::field(window, "hash"));
     Some(UpdateInfo {
         version,
         url,
@@ -41,12 +75,7 @@ pub fn parse_manifest(body: &str) -> Option<UpdateInfo<'_>> {
 
 /// 解析激活码字段 (C++ 返回的 activation.code, 设备端目前仅日志)
 pub fn parse_activation_code(body: &str) -> Option<&str> {
-    let pat = "\"activation\":";
-    let idx = body.find(pat)? + pat.len();
-    let window = body[idx..].trim_start();
-    let window = window.strip_prefix('{')?;
-    let end = window.find('}')?;
-    find_str_value(&window[..end], "code")
+    crate::server_msg::field(object_window(body, "activation")?, "code")
 }
 
 /// OTA 清单下发的 MQTT 网关配置 (存在时设备改走 MQTT+UDP 传输)
@@ -64,19 +93,14 @@ pub struct MqttConfig<'a> {
 
 /// 解析 OTA 清单中的 `mqtt` 对象; 未配置网关时返回 None (继续走 WebSocket)
 pub fn parse_mqtt_config(body: &str) -> Option<MqttConfig<'_>> {
-    let pat = "\"mqtt\":";
-    let idx = body.find(pat)? + pat.len();
-    let window = body[idx..].trim_start();
-    let window = window.strip_prefix('{')?;
-    let end = window.find('}')?;
-    let window = &window[..end];
+    let window = object_window(body, "mqtt")?;
     Some(MqttConfig {
-        endpoint: find_str_value(window, "endpoint")?,
-        client_id: find_str_value(window, "client_id")?,
-        username: find_str_value(window, "username")?,
-        password: find_str_value(window, "password").unwrap_or(""),
-        publish_topic: find_str_value(window, "publish_topic")?,
-        subscribe_topic: find_str_value(window, "subscribe_topic")?,
+        endpoint: crate::server_msg::field(window, "endpoint")?,
+        client_id: crate::server_msg::field(window, "client_id")?,
+        username: crate::server_msg::field(window, "username")?,
+        password: crate::server_msg::field(window, "password").unwrap_or(""),
+        publish_topic: crate::server_msg::field(window, "publish_topic")?,
+        subscribe_topic: crate::server_msg::field(window, "subscribe_topic")?,
     })
 }
 
@@ -156,20 +180,6 @@ fn parse_num(s: &str) -> u64 {
     // 去掉可能的非数字后缀 (如 "3-beta")
     let digits: &str = s.split(|c: char| !c.is_ascii_digit()).next().unwrap_or("0");
     digits.parse().unwrap_or(0)
-}
-
-/// 在 JSON 文本窗口中取 `"key":"值"`
-fn find_str_value<'a>(window: &'a str, key: &str) -> Option<&'a str> {
-    let mut pat = heapless::String::<40>::new();
-    pat.push('"').ok()?;
-    pat.push_str(key).ok()?;
-    pat.push('"').ok()?;
-    pat.push(':').ok()?;
-    let at = window.find(pat.as_str())?;
-    let v = window[at + pat.len()..].trim_start();
-    let v = v.strip_prefix('"')?;
-    let end = v.find('"')?;
-    Some(&v[..end])
 }
 
 // ===== otadata 选择条目 (对齐 IDF esp_ota_select_entry_t / 二级 bootloader) =====
@@ -436,6 +446,16 @@ mod tests {
             std::format!(r#"{{"firmware":{{"version":"1.0.0","url":"http://x","hash":"{H}"}}}}"#);
         assert_eq!(parse_manifest(&body).unwrap().sha256, Some(H));
         assert_eq!(parse_manifest(MANIFEST).unwrap().sha256, None);
+    }
+
+    #[test]
+    fn object_window_handles_braces_inside_strings() {
+        let body = r#"{"firmware":{"version":"1.0.0","url":"http://x/a}b","note":"{\"k\":\"v\"}"},"mqtt":{"endpoint":"h:1","client_id":"c","username":"u","password":"p}q","publish_topic":"t","subscribe_topic":"s"}}"#;
+        let info = parse_manifest(body).unwrap();
+        assert_eq!(info.version, "1.0.0");
+        assert_eq!(info.url, "http://x/a}b");
+        let m = parse_mqtt_config(body).unwrap();
+        assert_eq!(m.password, "p}q");
     }
 
     #[test]
