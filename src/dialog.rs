@@ -29,6 +29,68 @@ pub enum ListenMode {
     Manual,
 }
 
+/// 主循环阶段 — 把对话状态与固件侧的临时标志归并为一个显式状态
+///
+/// 固件用它决定灯语/显示，避免在主循环里散落 `if keyword_gate { ... }`
+/// 之类的布尔组合。门控优先于一切对话状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopPhase {
+    /// 关键词门控中：保持灯灭，不播放任何本地提示
+    Gated,
+    /// 待机且处于低功耗：灯灭
+    LowPowerIdle,
+    /// 待机
+    Idle,
+    /// 建立会话中
+    Connecting,
+    /// 聆听中
+    Listening,
+    /// 等待服务器回复
+    WaitingReply,
+    /// 播报中
+    Speaking,
+}
+
+impl LoopPhase {
+    /// 由对话状态与固件标志归并阶段（门控优先）
+    pub const fn from_state(state: DialogState, keyword_gate: bool, low_power: bool) -> Self {
+        if keyword_gate {
+            return Self::Gated;
+        }
+        match state {
+            DialogState::Idle if low_power => Self::LowPowerIdle,
+            DialogState::Idle => Self::Idle,
+            DialogState::Connecting => Self::Connecting,
+            DialogState::Listening => Self::Listening,
+            DialogState::WaitingReply => Self::WaitingReply,
+            DialogState::Speaking => Self::Speaking,
+        }
+    }
+
+    /// 日志标签
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Gated => "门控",
+            Self::LowPowerIdle => "低功耗待机",
+            Self::Idle => "待机",
+            Self::Connecting => "建连",
+            Self::Listening => "聆听",
+            Self::WaitingReply => "等回复",
+            Self::Speaking => "播报",
+        }
+    }
+}
+
+/// 服务器 ASR 文本是否包含唤醒词
+///
+/// 容忍常见误识别（小志/晓智），以及「你好 + 小」的拆词形式。
+pub fn stt_has_keyword(text: &str) -> bool {
+    text.contains("小智")
+        || text.contains("小志")
+        || text.contains("晓智")
+        || (text.contains("你好") && text.contains('小'))
+}
+
 /// 对话事件（固件从按键/网络/唤醒引擎投递）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogEvent {
@@ -341,5 +403,62 @@ mod barge_in_tests {
             acts.as_slice(),
             &[Action::SendTtsAbort, Action::SendListenStart]
         );
+    }
+
+    #[test]
+    fn loop_phase_gate_wins_over_every_state() {
+        for state in [
+            DialogState::Idle,
+            DialogState::Connecting,
+            DialogState::Listening,
+            DialogState::WaitingReply,
+            DialogState::Speaking,
+        ] {
+            assert_eq!(
+                LoopPhase::from_state(state, true, true),
+                LoopPhase::Gated,
+                "{state:?} 在门控期间应保持 Gated"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_phase_maps_states_and_low_power() {
+        assert_eq!(
+            LoopPhase::from_state(DialogState::Idle, false, true),
+            LoopPhase::LowPowerIdle
+        );
+        assert_eq!(
+            LoopPhase::from_state(DialogState::Idle, false, false),
+            LoopPhase::Idle
+        );
+        assert_eq!(
+            LoopPhase::from_state(DialogState::Connecting, false, true),
+            LoopPhase::Connecting,
+            "低功耗标志只影响 Idle"
+        );
+        assert_eq!(
+            LoopPhase::from_state(DialogState::Listening, false, false),
+            LoopPhase::Listening
+        );
+        assert_eq!(
+            LoopPhase::from_state(DialogState::WaitingReply, false, false),
+            LoopPhase::WaitingReply
+        );
+        assert_eq!(
+            LoopPhase::from_state(DialogState::Speaking, false, false),
+            LoopPhase::Speaking
+        );
+    }
+
+    #[test]
+    fn keyword_matching_tolerates_asr_variants() {
+        assert!(stt_has_keyword("你好小智"));
+        assert!(stt_has_keyword("小志在吗"));
+        assert!(stt_has_keyword("晓智"));
+        assert!(stt_has_keyword("你好，小"));
+        assert!(!stt_has_keyword("今天天气怎么样"));
+        assert!(!stt_has_keyword("你好"));
+        assert!(!stt_has_keyword(""));
     }
 }
