@@ -25,6 +25,7 @@ pub mod json_scan;
 pub mod mcp;
 pub mod mqtt;
 pub mod ota;
+pub mod port;
 pub mod protocol;
 pub mod server_msg;
 pub mod sha1;
