@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unparseable_event_fields() {
+    fn rejects_unparsable_event_fields() {
         assert_eq!(
             format_event(&Event::Wake {
                 latency_ms: 1,
