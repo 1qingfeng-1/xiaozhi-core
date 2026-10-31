@@ -191,8 +191,9 @@ fn parse_num(s: &str) -> u64 {
 // 者为活动镜像, slot = (ota_seq - 1) % app_count (我们 app_count=2 →
 // ota_0/ota_1 交替)。无工厂分区且 otadata 全 0xFF 时自愈 (启动 ota_0 并写
 // slot0={seq1,valid})。我们 OTA 时把**更高** seq 写入新 seq 映射的槽 (乒乓),
-// 旧 valid 条目保留作回滚候选; 新条目先置 PENDING_VERIFY, 新镜像启动并
-// 连通 WiFi 后由 confirm_running_image 置 VALID。
+// 旧 valid 条目保留作回滚候选; 新条目写 NEW, 若引导器启用 APP_ROLLBACK
+// 会在首次启动时转为 PENDING_VERIFY; 应用连通 WiFi 后由
+// confirm_running_image 置 VALID。
 
 /// otadata 未初始化序列号 (擦除态 0xFF)
 pub const UNINITIALIZED_SEQUENCE: u32 = 0xFFFF_FFFF;
@@ -277,9 +278,19 @@ impl OtaDataEntry {
         self.ota_state == OtaImageState::Valid && self.crc == ota_select_crc(self.ota_seq)
     }
 
-    /// 待确认 = 状态为 PendingVerify 且 crc 匹配 (新镜像首次启动)
+    /// 待确认 = 状态为 PendingVerify 且 crc 匹配 (回滚引导器首次启动后)
     pub fn is_pending(&self) -> bool {
         self.ota_state == OtaImageState::PendingVerify && self.crc == ota_select_crc(self.ota_seq)
+    }
+
+    /// 需要应用确认 = New（未启用回滚引导器）或 PendingVerify（已启用）
+    /// 且 crc 匹配。ota 写入方统一写 `New`，由引导器按配置转为
+    /// `PendingVerify`；应用确认后写 `Valid`。
+    pub fn needs_confirm(&self) -> bool {
+        matches!(
+            self.ota_state,
+            OtaImageState::New | OtaImageState::PendingVerify
+        ) && self.crc == ota_select_crc(self.ota_seq)
     }
 
     /// 序列标签 (版本串, 截止 NUL)
@@ -412,8 +423,8 @@ pub fn active_slot(entries: &[OtaDataEntry; 2], app_count: usize) -> Option<usiz
 ///
 /// 对齐 IDF `esp_ota_end`: 新 seq = 活动 seq + 1 (无活动条目时从 1 起);
 /// 目标槽 = `slot_for_seq(新 seq, app_count)` (双 app 乒乓: seq 奇→slot0,
-/// 偶→slot1)。新条目置 PENDING_VERIFY (启动确认后转 VALID), 旧 valid
-/// 条目保留作回滚候选。
+/// 偶→slot1)。新条目写 NEW (回滚引导器首启转 PENDING_VERIFY, 应用确认后
+/// 转 VALID), 旧 valid 条目保留作回滚候选。
 pub fn next_write(entries: &[OtaDataEntry; 2], app_count: usize) -> (u32, usize) {
     let active = active_seq(entries).unwrap_or(0);
     let new_seq = active.saturating_add(1);
@@ -593,6 +604,27 @@ mod tests {
         let mut bad = e;
         bad.crc ^= 1;
         assert!(!bad.is_pending());
+    }
+
+    #[test]
+    fn new_and_pending_both_need_confirmation() {
+        let new = OtaDataEntry::new(2, "1.0.1", OtaImageState::New);
+        assert!(new.needs_confirm());
+        assert!(
+            !new.is_pending(),
+            "New 是写入态, 不是引导器转换后的 PendingVerify"
+        );
+        assert!(!new.is_valid());
+
+        let pending = OtaDataEntry::new(2, "1.0.1", OtaImageState::PendingVerify);
+        assert!(pending.needs_confirm());
+
+        let valid = OtaDataEntry::new(2, "1.0.1", OtaImageState::Valid);
+        assert!(!valid.needs_confirm());
+
+        let mut bad = new;
+        bad.crc ^= 1;
+        assert!(!bad.needs_confirm());
     }
 
     #[test]
