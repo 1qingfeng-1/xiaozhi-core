@@ -26,6 +26,23 @@ pub fn extract_slot(frames: &[u8], slot_count: usize, slot_index: usize, out: &m
     n
 }
 
+/// 从 2 通道 i16-LE 交织帧中提取全部样本, 保持 L,R,L,R... 顺序
+///
+/// - `frames`: DMA 原始字节, 每帧 4B (L 2B + R 2B, 小端);
+/// - `out_lr`: 输出缓冲, 写入 L,R 交织样本; 不足部分截断。
+///
+/// 返回写入的 i16 数量 (= 2 × 帧数); 奇数字节尾部被丢弃。
+/// 用于 2 麦 WakeNet: 模型需要真实的 2 通道交织输入, 不能复制单通道。
+pub fn extract_two_slots(frames: &[u8], out_lr: &mut [i16]) -> usize {
+    let frames_n = (frames.len() / 4).min(out_lr.len() / 2);
+    for i in 0..frames_n {
+        let o = i * 4;
+        out_lr[2 * i] = i16::from_le_bytes([frames[o], frames[o + 1]]);
+        out_lr[2 * i + 1] = i16::from_le_bytes([frames[o + 2], frames[o + 3]]);
+    }
+    frames_n * 2
+}
+
 /// 软件增益 (百分比, 100 = 0 dB), 饱和处理防溢出
 ///
 /// 支持 >100 (放大) 与 0..100 (衰减); 0 = 数字静音。
@@ -105,9 +122,112 @@ pub fn level_stats(samples: &[i16]) -> (i32, i32) {
     (mean, (sum_dev_sq / n as i64).isqrt() as i32)
 }
 
+/// WakeNet 输入块条件化: 去 DC + **峰值限制增益**（单块单增益，波形不变）。
+///
+/// 背景（真机 2026-11-08 定位）：
+/// - 麦克风数字电平仅 1~5% 满幅，WakeNet 需要 1500% 级增益；
+/// - 用户贴近设备/大声说唤醒词时，固定 15x 会把大量样本削顶成方波，
+///   MFCC 被谐波破坏 → 模型不命中（表现为“播放提示音后无法唤醒”）；
+/// - 旧实现去 DC 用 `i16::wrapping_sub`，削顶块减去较大的 DC 均值后
+///   负半周回绕成正值，整块被折叠（日志里 `mean=±8000, rms≈18000`
+///   的“饱和块”），进一步毁掉特征。
+///
+/// 本函数在 i32 域去 DC 并按 AC 峰值等比限制增益：正常块保持
+/// `gain_percent`（默认 1500%），只有会超过 `target_peak` 的块才降增益，
+/// 输出永不削顶。返回实际使用的增益（%）。
+pub fn condition_wakenet_block(frame: &mut [i16], gain_percent: i32, target_peak: i32) -> i32 {
+    let n = frame.len();
+    if n == 0 {
+        return gain_percent;
+    }
+    let sum = frame.iter().map(|&s| s as i32).sum::<i32>();
+    // 必须在 i32 域保留均值: 削顶块的 AC 分量很大, 但均值仍可为任一 i16 值;
+    // 真正的问题是减均值时用 i16 wrapping 会回绕。
+    let mean = sum / n as i32;
+    let mut peak = 0i32;
+    for &s in frame.iter() {
+        peak = peak.max((s as i32 - mean).abs());
+    }
+    // 纯 DC 块: 输出去 DC 后全零, 增益无意义
+    let gain = if peak <= 0 {
+        0
+    } else {
+        ((target_peak.max(1) as i64 * 100) / peak as i64).min(gain_percent.max(0) as i64) as i32
+    };
+    for s in frame.iter_mut() {
+        let d = *s as i32 - mean;
+        *s = ((d * gain) / 100).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    }
+    gain
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wakenet_block_normal_gain_and_dc_removal() {
+        // DC 3000 + ±100 交流: 正常电平块用满增益 1500%，输出以 0 为中心
+        let mut f = [0i16; 64];
+        for (i, s) in f.iter_mut().enumerate() {
+            *s = 3000 + if i % 2 == 0 { 100 } else { -100 };
+        }
+        let gain = condition_wakenet_block(&mut f, 1500, 30_000);
+        assert_eq!(gain, 1500);
+        assert_eq!(f[0], 1500);
+        assert_eq!(f[1], -1500);
+        let (mean, _) = level_stats(&f);
+        assert_eq!(mean, 0);
+    }
+
+    #[test]
+    fn wakenet_block_limits_loud_blocks_without_clipping() {
+        // ±3000 的响度: 1500% 会到 ±45000 削顶 → 限到 ±30000
+        let mut f = [0i16; 64];
+        for (i, s) in f.iter_mut().enumerate() {
+            *s = if i % 2 == 0 { 3000 } else { -3000 };
+        }
+        let gain = condition_wakenet_block(&mut f, 1500, 30_000);
+        assert_eq!(gain, 1000);
+        assert_eq!(f[0], 30000);
+        assert_eq!(f[1], -30000);
+    }
+
+    #[test]
+    fn wakenet_block_clipped_square_wave_is_not_folded() {
+        // 回归: 旧实现 i16::wrapping_sub 会把负半周 +32768 回绕成正值,
+        // 整块均值变 +8000 级别。现在应从 i32 域去除 DC, 两侧对称。
+        let mut f = [0i16; 512];
+        for (i, s) in f.iter_mut().enumerate() {
+            *s = if i % 2 == 0 { 32767 } else { -32768 };
+        }
+        let gain = condition_wakenet_block(&mut f, 1500, 30_000);
+        assert_eq!(gain, 91); // AC 峰值 32768 → 30000*100/32768 = 91
+        assert!(f.iter().all(|&s| s.abs() <= 30_000));
+        let (mean, _) = level_stats(&f);
+        assert!(mean.abs() <= 1);
+
+        // 非对称削顶块 (1/3 负样本): 旧代码会因回绕得到正的虚假 DC
+        let mut f = [0i16; 512];
+        for (i, s) in f.iter_mut().enumerate() {
+            *s = if i % 3 == 0 { -32768 } else { 32767 };
+        }
+        let gain = condition_wakenet_block(&mut f, 1500, 30_000);
+        assert!(gain > 0 && gain < 100);
+        let (mean, _) = level_stats(&f);
+        assert!(mean.abs() <= 2);
+        assert!(f.iter().all(|&s| s.abs() <= 30_000));
+    }
+
+    #[test]
+    fn wakenet_block_handles_silence_and_empty() {
+        let mut f = [123i16; 32];
+        let gain = condition_wakenet_block(&mut f, 1500, 30_000);
+        assert_eq!(gain, 0);
+        assert!(f.iter().all(|&s| s == 0));
+        let mut empty: [i16; 0] = [];
+        assert_eq!(condition_wakenet_block(&mut empty, 1500, 30_000), 1500);
+    }
 
     /// 构造交错帧字节: 每帧 3 个 i16-LE 写入 buf
     fn write_frames(buf: &mut [u8], frames: &[[i16; 3]]) {
@@ -152,6 +272,54 @@ mod tests {
         assert_eq!(extract_slot(&[0u8; 3], 2, 0, &mut out), 0); // 不足一帧
         assert_eq!(extract_slot(&[0u8; 8], 2, 2, &mut out), 0); // 槽位越界
         assert_eq!(extract_slot(&[0u8; 8], 0, 0, &mut out), 0); // 槽数为 0
+    }
+
+    /// 构造 2 通道交织帧字节: 每帧 L,R 写入 buf
+    fn write_stereo_frames(buf: &mut [u8], frames: &[[i16; 2]]) {
+        for (i, f) in frames.iter().enumerate() {
+            for (j, s) in f.iter().enumerate() {
+                let le = s.to_le_bytes();
+                let o = (i * 2 + j) * 2;
+                buf[o..o + 2].copy_from_slice(&le);
+            }
+        }
+    }
+
+    #[test]
+    fn extract_two_slots_keeps_interleaved_lr() {
+        let mut bytes = [0u8; 16];
+        write_stereo_frames(
+            &mut bytes,
+            &[[100, -200], [-300, 400], [500, -600], [700, -800]],
+        );
+        let mut out = [0i16; 8];
+        assert_eq!(extract_two_slots(&bytes, &mut out), 8);
+        assert_eq!(out, [100, -200, -300, 400, 500, -600, 700, -800]);
+    }
+
+    #[test]
+    fn extract_two_slots_truncates_to_output_and_drops_odd_bytes() {
+        let mut bytes = [0u8; 12];
+        write_stereo_frames(&mut bytes, &[[1, 2], [3, 4], [5, 6]]);
+        // 输出只能放 2 帧 (4 个 i16)
+        let mut out = [0i16; 4];
+        assert_eq!(extract_two_slots(&bytes, &mut out), 4);
+        assert_eq!(out, [1, 2, 3, 4]);
+        // 奇数字节: 只有完整 4B 帧参与, 尾部 3 字节丢弃
+        let mut out2 = [0i16; 8];
+        assert_eq!(extract_two_slots(&bytes[..7], &mut out2), 2);
+        assert_eq!(&out2[..2], &[1, 2]);
+    }
+
+    #[test]
+    fn extract_two_slots_handles_empty_and_negative_values() {
+        let mut out = [0i16; 4];
+        assert_eq!(extract_two_slots(&[], &mut out), 0);
+        assert_eq!(extract_two_slots(&[0u8; 3], &mut out), 0);
+        // 小端与负数: FF 7F -> 32767, 00 80 -> -32768
+        let bytes = [0xFF, 0x7F, 0x00, 0x80];
+        assert_eq!(extract_two_slots(&bytes, &mut out), 2);
+        assert_eq!(&out[..2], &[32767, -32768]);
     }
 
     #[test]
