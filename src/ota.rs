@@ -2,31 +2,153 @@
 //!
 //! 三块:
 //! 1. **清单解析**: 协议 (对齐 C++ ota.cc) POST http://<server>:8003/xiaozhi/ota/
-//!    返回 `{"firmware":{"version":"1.2.3","url":"http://..."},"activation":{...}}`;
-//!    `parse_manifest` 取版本/url, `compare_versions` 语义化比较, `validate_image_header`
-//!    校验 e9 镜像头 (magic + app_desc → 版本)。
+//!    返回 `{"firmware":{"version":"1.2.3","url":"http://..."},"activation":{...},`
+//!    `"server_time":{...},"websocket":{...}}`; `parse_manifest` 取固件字段及可选的
+//!    force/server_time/websocket, `compare_versions` 语义化比较,
+//!    `validate_image_header` 校验 e9 镜像头 (magic + app_desc → 版本)。
 //! 2. **otadata 选择条目**: `OtaDataEntry` (32B, 对齐 IDF `esp_ota_select_entry_t`)
 //!    的编解码 + `ota_select_crc` (reflected CRC-32, init 0, xorout 0xFFFFFFFF) +
 //!    `active_seq`/`active_slot`/`next_write` (双 app 乒乓切换 + 回滚保留)。
 //!    供固件烧写新镜像后写 otadata 分区, 二级 bootloader 据此选活动槽。
 
-/// 固件更新信息
+/// OTA 清单 — 固件更新信息 + 可选服务端时间/WebSocket 配置
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UpdateInfo<'a> {
+pub struct OtaManifest<'a> {
     pub version: &'a str,
     pub url: &'a str,
     /// 可选镜像 SHA-256 (服务端支持时下发; 兼容 `sha256` / `hash` 两种键)
     pub sha256: Option<&'a str>,
+    /// `firmware.force == 1`: 强制升级 (字段缺失或为 0 → false)
+    pub force: bool,
+    /// `server_time` 对象 (缺失 → None, 不影响清单其余字段)
+    pub server_time: Option<ServerTime>,
+    /// `websocket` 对象 (缺失/不完整 → None, 不影响清单其余字段)
+    pub websocket: Option<WebsocketConfig<'a>>,
 }
 
-/// 取 `"key": { ... }` 对象窗口 (含大括号), 正确处理字符串内的 `{}` 与转义
+/// 兼容旧名 (原 `parse_manifest` 返回类型)
+pub type UpdateInfo<'a> = OtaManifest<'a>;
+
+/// 服务端时间 (对齐 C++ ota.cc `server_time` 对象)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerTime {
+    /// 原始 Unix 毫秒时间戳 (UTC 基准)
+    pub timestamp_ms: u64,
+    /// 时区偏移 (分钟, 可为负; 东八区 = 480)
+    pub timezone_offset_min: i32,
+}
+
+impl ServerTime {
+    /// 本地时间 (Unix 毫秒): `timestamp_ms + timezone_offset_min * 60_000`
+    ///
+    /// 对齐 C++ `ota.cc` 的 `ts += timezone_offset * 60 * 1000` 后再
+    /// `settimeofday` 的语义。用 `i64` 避免负偏移/极端时间戳溢出,
+    /// 时间戳超出 `i64` 时饱和到 `i64::MAX`。
+    pub fn epoch_ms(&self) -> i64 {
+        i64::try_from(self.timestamp_ms)
+            .unwrap_or(i64::MAX)
+            .saturating_add(i64::from(self.timezone_offset_min) * 60_000)
+    }
+}
+
+/// 服务端下发的 WebSocket 连接参数
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebsocketConfig<'a> {
+    pub url: &'a str,
+    /// 缺 token 时为 `""` (对齐 C++: 只是不加 Authorization 头)
+    pub token: &'a str,
+    /// 协议版本; 缺失/非法/0 时默认 1 (C++ `if (version != 0)`)
+    pub version: u8,
+}
+
+/// 找到对象成员 `"key":` 的值起点 (冒号后, 跳过空白)
+///
+/// 只在根对象 (`depth == 1`) 的成员位置匹配, 并在扫描时跳过完整字符串字面量
+/// (含 `\"` 转义), 避免把字符串值里的 `\"key\":` 文本或嵌套对象中的同名键
+/// 误当成清单顶层字段。`json` 必须从根对象的 `{` 开始。
+fn value_pos(json: &str, key: &str) -> Option<usize> {
+    let bytes = json.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let end = string_end(bytes, i + 1)?;
+                if let Some(pos) = key_value_pos(bytes, key, i, depth, end) {
+                    return Some(pos);
+                }
+                i = end + 1;
+            },
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            },
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            },
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// 字符串字面量闭合引号下标 (从 `start` 开始, 跳过 `\"` 转义); 未闭合 → None
+fn string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut j = start;
+    let mut esc = false;
+    while j < bytes.len() {
+        if esc {
+            esc = false;
+        } else if bytes[j] == b'\\' {
+            esc = true;
+        } else if bytes[j] == b'"' {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
+}
+
+/// 若 `quote..end` 是根对象的成员键 `key`, 返回值起点 (冒号后)
+fn key_value_pos(bytes: &[u8], key: &str, quote: usize, depth: usize, end: usize) -> Option<usize> {
+    if depth != 1 || &bytes[quote + 1..end] != key.as_bytes() || !is_member_key(bytes, quote) {
+        return None;
+    }
+    let k = skip_ws(bytes, end + 1);
+    if k < bytes.len() && bytes[k] == b':' {
+        Some(skip_ws(bytes, k + 1))
+    } else {
+        None
+    }
+}
+
+/// 跳过空白, 返回下一个非空白字符下标
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// 键名前必须是 `{` 或 `,` (中间允许空白), 排除值内文本
+fn is_member_key(bytes: &[u8], quote: usize) -> bool {
+    let mut i = quote;
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' | b'\n' => continue,
+            b'{' | b',' => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// 取根对象成员 `"key": { ... }` 的窗口 (含大括号), 正确处理字符串内 `{}`/转义
 fn object_window<'a>(body: &'a str, key: &str) -> Option<&'a str> {
-    let mut pat = heapless::String::<40>::new();
-    pat.push('"').ok()?;
-    pat.push_str(key).ok()?;
-    pat.push_str("\":").ok()?;
-    let idx = body.find(pat.as_str())? + pat.len();
-    let rest = body[idx..].trim_start();
+    let start = value_pos(body, key)?;
+    let rest = &body[start..];
     if !rest.starts_with('{') {
         return None;
     }
@@ -59,23 +181,145 @@ fn object_window<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-/// 解析 OTA 清单, 提取 firmware.version / firmware.url / 可选 sha256
-pub fn parse_manifest(body: &str) -> Option<UpdateInfo<'_>> {
-    let window = object_window(body, "firmware")?;
-    let version = crate::server_msg::field(window, "version")?;
-    let url = crate::server_msg::field(window, "url")?;
-    let sha256 = crate::server_msg::field(window, "sha256")
-        .or_else(|| crate::server_msg::field(window, "hash"));
-    Some(UpdateInfo {
+/// 取窗口内字符串成员 (值保留原样, 不解转义; 与 `server_msg::field` 一致)
+fn str_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let rest = &json[value_pos(json, key)?..];
+    let body = rest.strip_prefix('"')?;
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    let mut esc = false;
+    while i < bytes.len() {
+        if esc {
+            esc = false;
+        } else if bytes[i] == b'\\' {
+            esc = true;
+        } else if bytes[i] == b'"' {
+            return Some(&body[..i]);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 取窗口内数字成员 (返回数字字面量)
+///
+/// 只接受十进制整数或小数 (`-` 允许, `+` 拒绝); `1e2`/`1.7e12` 这类指数形式
+/// 返回 None, 避免把指数误截断成尾数 (1e2 不能读成 1)。
+fn num_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let rest = &json[value_pos(json, key)?..];
+    let bytes = rest.as_bytes();
+    let mut i = 0usize;
+    if i < bytes.len() && bytes[i] == b'-' {
+        i += 1;
+    }
+    let digits = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == digits {
+        return None;
+    }
+    // 小数部分: 保留字面量, 是否接受由 parse_whole 判定
+    if i < bytes.len() && bytes[i] == b'.' {
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > i + 1 {
+            i = j;
+        }
+    }
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        return None;
+    }
+    Some(&rest[..i])
+}
+
+/// 解析“整数值”数字: 允许 `1`/`1.0`/`-2`, 拒绝 `1.5`/`1e2` (失败 → None)
+fn parse_whole<T: core::str::FromStr>(v: &str) -> Option<T> {
+    let mut parts = v.splitn(2, '.');
+    let int = parts.next()?;
+    if let Some(frac) = parts.next()
+        && !frac.bytes().all(|b| b == b'0')
+    {
+        return None;
+    }
+    int.parse().ok()
+}
+
+fn parse_server_time(body: &str) -> Option<ServerTime> {
+    let window = object_window(body, "server_time")?;
+    // timestamp 是毫秒 (u64), 缺失/负数/溢出/非整数 → 整个 server_time 视为缺失
+    let timestamp_ms = num_field(window, "timestamp").and_then(parse_whole::<u64>)?;
+    // 时区缺失 (或非数字) 按 0 处理, 对齐 C++ (不应用偏移)
+    let timezone_offset_min = num_field(window, "timezone_offset")
+        .and_then(parse_whole::<i32>)
+        .unwrap_or(0);
+    Some(ServerTime {
+        timestamp_ms,
+        timezone_offset_min,
+    })
+}
+
+fn parse_websocket(body: &str) -> Option<WebsocketConfig<'_>> {
+    let window = object_window(body, "websocket")?;
+    Some(WebsocketConfig {
+        // 缺 url 视为没有可用配置; 缺 token 仍可连接 (C++ 只是不加 Authorization)
+        url: str_field(window, "url")?,
+        token: str_field(window, "token").unwrap_or(""),
+        // C++: version != 0 才覆盖默认; 缺失/0/非法 → 1
+        version: num_field(window, "version")
+            .and_then(parse_whole::<u8>)
+            .filter(|&v| v != 0)
+            .unwrap_or(1),
+    })
+}
+
+/// 解析 OTA 清单, 提取 firmware.version/url/可选 sha256/force 及
+/// 可选的 server_time / websocket (缺失返回 None, 不使整体解析失败)
+///
+/// 对齐 C++: `firmware`/`server_time`/`websocket` 三块独立解析。若响应没有
+/// `firmware` (例如仅下发校时/WS 参数), 返回 `version == "" && url == ""` 的
+/// 清单, 下游按空版本判定无更新; 若三块都没有则返回 None。
+pub fn parse_manifest(body: &str) -> Option<OtaManifest<'_>> {
+    let server_time = parse_server_time(body);
+    let websocket = parse_websocket(body);
+    let Some(window) = object_window(body, "firmware") else {
+        let has_sections = server_time.is_some() || websocket.is_some();
+        return if has_sections {
+            Some(OtaManifest {
+                version: "",
+                url: "",
+                sha256: None,
+                force: false,
+                server_time,
+                websocket,
+            })
+        } else {
+            None
+        };
+    };
+    let version = str_field(window, "version")?;
+    let url = str_field(window, "url")?;
+    let sha256 = str_field(window, "sha256").or_else(|| str_field(window, "hash"));
+    // 对齐 C++: 只有数值 1 才算强制 (字符串 "1"/1.5 都不算)
+    let force = matches!(
+        num_field(window, "force").and_then(parse_whole::<i64>),
+        Some(1)
+    );
+    Some(OtaManifest {
         version,
         url,
         sha256,
+        force,
+        server_time,
+        websocket,
     })
 }
 
 /// 解析激活码字段 (C++ 返回的 activation.code, 设备端目前仅日志)
 pub fn parse_activation_code(body: &str) -> Option<&str> {
-    crate::server_msg::field(object_window(body, "activation")?, "code")
+    str_field(object_window(body, "activation")?, "code")
 }
 
 /// OTA 清单下发的 MQTT 网关配置 (存在时设备改走 MQTT+UDP 传输)
@@ -95,12 +339,12 @@ pub struct MqttConfig<'a> {
 pub fn parse_mqtt_config(body: &str) -> Option<MqttConfig<'_>> {
     let window = object_window(body, "mqtt")?;
     Some(MqttConfig {
-        endpoint: crate::server_msg::field(window, "endpoint")?,
-        client_id: crate::server_msg::field(window, "client_id")?,
-        username: crate::server_msg::field(window, "username")?,
-        password: crate::server_msg::field(window, "password").unwrap_or(""),
-        publish_topic: crate::server_msg::field(window, "publish_topic")?,
-        subscribe_topic: crate::server_msg::field(window, "subscribe_topic")?,
+        endpoint: str_field(window, "endpoint")?,
+        client_id: str_field(window, "client_id")?,
+        username: str_field(window, "username")?,
+        password: str_field(window, "password").unwrap_or(""),
+        publish_topic: str_field(window, "publish_topic")?,
+        subscribe_topic: str_field(window, "subscribe_topic")?,
     })
 }
 
@@ -475,6 +719,195 @@ mod tests {
     fn manifest_missing_url_is_none() {
         assert_eq!(parse_manifest(r#"{"firmware":{"version":"1.0"}}"#), None);
         assert_eq!(parse_manifest("not json"), None);
+    }
+
+    #[test]
+    fn parses_force_flag() {
+        let one = r#"{"firmware":{"version":"1.0.0","url":"http://x","force":1}}"#;
+        assert!(parse_manifest(one).unwrap().force);
+
+        let zero = r#"{"firmware":{"version":"1.0.0","url":"http://x","force":0}}"#;
+        assert!(!parse_manifest(zero).unwrap().force);
+
+        // 缺失 → false (现有 MANIFEST 亦覆盖)
+        assert!(!parse_manifest(MANIFEST).unwrap().force);
+
+        // 对齐 C++ cJSON_IsNumber: 字符串 "1"/其它数值都不算强制
+        let quoted = r#"{"firmware":{"version":"1.0.0","url":"http://x","force":"1"}}"#;
+        assert!(!parse_manifest(quoted).unwrap().force);
+        let other = r#"{"firmware":{"version":"1.0.0","url":"http://x","force":2}}"#;
+        assert!(!parse_manifest(other).unwrap().force);
+
+        // 1.0 是整数值; 1.5 / 1e2 不是 1 (不能静默截断)
+        let whole = r#"{"firmware":{"version":"1.0.0","url":"http://x","force":1.0}}"#;
+        assert!(parse_manifest(whole).unwrap().force);
+        let fraction = r#"{"firmware":{"version":"1.0.0","url":"http://x","force":1.5}}"#;
+        assert!(!parse_manifest(fraction).unwrap().force);
+        let exp = r#"{"firmware":{"version":"1.0.0","url":"http://x","force":1e2}}"#;
+        assert!(!parse_manifest(exp).unwrap().force);
+        let plus = r#"{"firmware":{"version":"1.0.0","url":"http://x","force":+1}}"#;
+        assert!(!parse_manifest(plus).unwrap().force);
+    }
+
+    #[test]
+    fn parses_server_time_timezone() {
+        // 毫秒时间戳 (超出 u32) + 东八区
+        let east = r#"{"firmware":{"version":"1.0.0","url":"http://x"},"server_time":{"timestamp":1700000000123,"timezone_offset":480}}"#;
+        let st = parse_manifest(east).unwrap().server_time.unwrap();
+        assert_eq!(st.timestamp_ms, 1_700_000_000_123);
+        assert_eq!(st.timezone_offset_min, 480);
+        // 对齐 C++: 本地时间 = timestamp + offset*60000
+        assert_eq!(st.epoch_ms(), 1_700_028_800_123);
+
+        // 负时区
+        let west = r#"{"firmware":{"version":"1.0.0","url":"http://x"},"server_time":{"timestamp":1700000000123,"timezone_offset":-300}}"#;
+        let st = parse_manifest(west).unwrap().server_time.unwrap();
+        assert_eq!(st.timezone_offset_min, -300);
+        assert_eq!(st.epoch_ms(), 1_699_982_000_123);
+
+        // timezone_offset 缺失 → 0 (对齐 C++, 不应用偏移)
+        let no_tz =
+            r#"{"firmware":{"version":"1.0.0","url":"http://x"},"server_time":{"timestamp":42}}"#;
+        let st = parse_manifest(no_tz).unwrap().server_time.unwrap();
+        assert_eq!((st.timestamp_ms, st.timezone_offset_min), (42, 0));
+        assert_eq!(st.epoch_ms(), 42);
+    }
+
+    #[test]
+    fn server_time_missing_or_invalid_is_none() {
+        // 整个 server_time 缺失
+        assert_eq!(parse_manifest(MANIFEST).unwrap().server_time, None);
+        // 有对象但缺 timestamp → None, 清单其余字段仍可用
+        let no_ts = r#"{"firmware":{"version":"1.0.0","url":"http://x"},"server_time":{"timezone_offset":480}}"#;
+        let m = parse_manifest(no_ts).unwrap();
+        assert_eq!(m.server_time, None);
+        assert_eq!(m.version, "1.0.0");
+        // timestamp 非数字 / 负数 → None
+        let bad = r#"{"firmware":{"version":"1.0.0","url":"http://x"},"server_time":{"timestamp":"1700000000123","timezone_offset":480}}"#;
+        assert_eq!(parse_manifest(bad).unwrap().server_time, None);
+        let neg =
+            r#"{"firmware":{"version":"1.0.0","url":"http://x"},"server_time":{"timestamp":-1}}"#;
+        assert_eq!(parse_manifest(neg).unwrap().server_time, None);
+        // 指数形式 (1.7e12) 必须视为非法, 不能截断成 1
+        let exp = r#"{"firmware":{"version":"1.0.0","url":"http://x"},"server_time":{"timestamp":1.7e12}}"#;
+        assert_eq!(parse_manifest(exp).unwrap().server_time, None);
+        // 非零小数同样不接受
+        let frac =
+            r#"{"firmware":{"version":"1.0.0","url":"http://x"},"server_time":{"timestamp":1.5}}"#;
+        assert_eq!(parse_manifest(frac).unwrap().server_time, None);
+        // + 前缀非法
+        let plus =
+            r#"{"firmware":{"version":"1.0.0","url":"http://x"},"server_time":{"timestamp":+42}}"#;
+        assert_eq!(parse_manifest(plus).unwrap().server_time, None);
+    }
+
+    #[test]
+    fn parses_websocket_config() {
+        let full = r#"{"firmware":{"version":"1.0.0","url":"http://x"},"websocket":{"url":"ws://192.168.1.7:8000/xiaozhi/v1/","token":"secret","version":2}}"#;
+        let ws = parse_manifest(full).unwrap().websocket.unwrap();
+        assert_eq!(ws.url, "ws://192.168.1.7:8000/xiaozhi/v1/");
+        assert_eq!(ws.token, "secret");
+        assert_eq!(ws.version, 2);
+
+        // version 缺失 → 默认 1
+        let no_ver = r#"{"firmware":{"version":"1.0.0","url":"http://x"},"websocket":{"url":"ws://h/","token":"t"}}"#;
+        assert_eq!(
+            parse_manifest(no_ver).unwrap().websocket.unwrap().version,
+            1
+        );
+
+        // 对齐 C++ `if (version != 0)`: 0 / 越界 / 非整数 → 回退 1
+        for v in ["0", "256", "-1", "1.5", "1e2"] {
+            let body = std::format!(
+                r#"{{"firmware":{{"version":"1.0.0","url":"http://x"}},"websocket":{{"url":"ws://h/","version":{v}}}}}"#
+            );
+            assert_eq!(
+                parse_manifest(&body).unwrap().websocket.unwrap().version,
+                1,
+                "version={v} 应回退 1"
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_missing_sections_do_not_fail_manifest() {
+        // 无 websocket 对象
+        assert_eq!(parse_manifest(MANIFEST).unwrap().websocket, None);
+        // 缺 token → token 为空串, url 仍有效 (C++ 只是不加 Authorization)
+        let no_token =
+            r#"{"firmware":{"version":"1.0.0","url":"http://x"},"websocket":{"url":"ws://h/"}}"#;
+        let m = parse_manifest(no_token).unwrap();
+        let ws = m.websocket.unwrap();
+        assert_eq!((ws.url, ws.token, ws.version), ("ws://h/", "", 1));
+        assert_eq!(m.url, "http://x");
+        // 缺 url → 视为无可用 websocket 配置
+        let no_url =
+            r#"{"firmware":{"version":"1.0.0","url":"http://x"},"websocket":{"token":"t"}}"#;
+        assert_eq!(parse_manifest(no_url).unwrap().websocket, None);
+        // websocket 不是对象 → None
+        let not_obj = r#"{"firmware":{"version":"1.0.0","url":"http://x"},"websocket":"off"}"#;
+        assert_eq!(parse_manifest(not_obj).unwrap().websocket, None);
+    }
+
+    #[test]
+    fn manifest_key_scanning_skips_string_contents() {
+        // 字符串值里伪造的 "firmware"/"version" 不能被当成真实字段
+        let fake_top = r#"{"note":"evil,\"firmware\":{\"version\":\"9.9.9\",\"url\":\"evil\"}","firmware":{"version":"1.0.0","url":"http://good"}}"#;
+        let m = parse_manifest(fake_top).unwrap();
+        assert_eq!((m.version, m.url), ("1.0.0", "http://good"));
+
+        // firmware 对象内字符串值里的 "version" 同理
+        let fake_inner = r#"{"firmware":{"note":"x, \"version\":\"9.9.9\"","version":"1.0.0","url":"http://good"}}"#;
+        assert_eq!(parse_manifest(fake_inner).unwrap().version, "1.0.0");
+    }
+
+    #[test]
+    fn manifest_without_firmware_parses_optional_sections() {
+        // 对齐 C++: 三块独立解析, 仅下发校时/WS 参数也应成功
+        let body = r#"{"server_time":{"timestamp":1700000000123,"timezone_offset":480},"websocket":{"url":"ws://h/","token":"t"}}"#;
+        let m = parse_manifest(body).unwrap();
+        assert_eq!((m.version, m.url), ("", ""));
+        assert_eq!((m.sha256, m.force), (None, false));
+        assert_eq!(m.server_time.unwrap().timestamp_ms, 1_700_000_000_123);
+        assert_eq!(m.websocket.unwrap().url, "ws://h/");
+
+        // 仅 websocket 也可
+        let only_ws = r#"{"websocket":{"url":"ws://h/"}}"#;
+        assert!(parse_manifest(only_ws).unwrap().websocket.is_some());
+
+        // 没有任何已知 section → None (保持严格)
+        assert_eq!(parse_manifest(r#"{"activation":{"code":"123"}}"#), None);
+        assert_eq!(parse_manifest("{}"), None);
+        assert_eq!(parse_manifest("not json"), None);
+    }
+
+    #[test]
+    fn manifest_nested_duplicate_and_escaped_values() {
+        // 嵌套对象中的同名 key 不算顶层
+        let nested = r#"{"wrapper":{"firmware":{"version":"9.9.9","url":"evil"},"server_time":{"timestamp":7}},"firmware":{"version":"1.0.0","url":"http://good"}}"#;
+        let m = parse_manifest(nested).unwrap();
+        assert_eq!((m.version, m.url), ("1.0.0", "http://good"));
+        assert_eq!(m.server_time, None);
+
+        // 重复 key 取首个成员 (对齐 cJSON_GetObjectItem)
+        let dup = r#"{"firmware":{"version":"1.0.0","url":"http://first","version":"2.0.0","url":"http://second"}}"#;
+        let m = parse_manifest(dup).unwrap();
+        assert_eq!((m.version, m.url), ("1.0.0", "http://first"));
+
+        // 转义斜杠不截断值; 零拷贝契约下保留原始转义形式 (`\/` 不解码)
+        let escaped = r#"{"firmware":{"version":"1.0.0","url":"http://x"},"websocket":{"url":"ws:\/\/h","token":"t"}}"#;
+        assert_eq!(
+            parse_manifest(escaped).unwrap().websocket.unwrap().url,
+            r"ws:\/\/h"
+        );
+    }
+
+    #[test]
+    fn mqtt_config_ignores_nested_same_name_keys() {
+        let body = r#"{"wrapper":{"mqtt":{"endpoint":"evil:1","client_id":"e","username":"e","publish_topic":"e","subscribe_topic":"e"}},"mqtt":{"endpoint":"good:1883","client_id":"c","username":"u","publish_topic":"p","subscribe_topic":"s"}}"#;
+        let m = parse_mqtt_config(body).unwrap();
+        assert_eq!(m.endpoint, "good:1883");
+        assert_eq!(m.client_id, "c");
     }
 
     #[test]
