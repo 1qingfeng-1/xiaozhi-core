@@ -201,6 +201,44 @@ fn str_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+/// 把 JSON 字符串值反转义后写入定长缓冲
+///
+/// 支持 `\" \\ \/ \b \f \n \r \t \uXXXX`; 代理对/非法转义/容量不足返回
+/// None。大多数服务端 (Python `json.dumps`) 不转义 `/`, 但 PHP 默认会输出
+/// `ws:\/\/...`, 不解转义会让 URL 匹配失败并静默回退默认服务器。
+pub fn unescape_json<const N: usize>(src: &str, out: &mut heapless::String<N>) -> Option<()> {
+    out.clear();
+    let mut it = src.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c).ok()?;
+            continue;
+        }
+        let e = it.next()?;
+        let ch = match e {
+            '"' => '"',
+            '\\' => '\\',
+            '/' => '/',
+            'b' => '\u{8}',
+            'f' => '\u{c}',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'u' => {
+                let mut v = 0u32;
+                for _ in 0..4 {
+                    v = v.checked_mul(16)?.checked_add(it.next()?.to_digit(16)?)?;
+                }
+                // 代理对不在清单字段范围内, from_u32 对孤立代理返回 None
+                char::from_u32(v)?
+            },
+            _ => return None,
+        };
+        out.push(ch).ok()?;
+    }
+    Some(())
+}
+
 /// 取窗口内数字成员 (返回数字字面量)
 ///
 /// 只接受十进制整数或小数 (`-` 允许, `+` 拒绝); `1e2`/`1.7e12` 这类指数形式
@@ -522,6 +560,20 @@ impl OtaDataEntry {
         self.ota_state == OtaImageState::Valid && self.crc == ota_select_crc(self.ota_seq)
     }
 
+    /// 可启动条目 = 擦除态排除 + crc 匹配 + 状态不是 Invalid/Aborted。
+    ///
+    /// 对齐 ESP-IDF v5.5.2 `bootloader_common_loader.c`: NEW/PENDING_VERIFY/
+    /// VALID 都视为可启动。用于 [`active_seq`] 判断"当前实际运行的槽",
+    /// 避免确认失败 (仍为 PENDING_VERIFY) 时把镜像写进正在运行的槽。
+    pub fn is_bootable(&self) -> bool {
+        self.ota_seq != u32::MAX
+            && self.crc == ota_select_crc(self.ota_seq)
+            && !matches!(
+                self.ota_state,
+                OtaImageState::Invalid | OtaImageState::Aborted
+            )
+    }
+
     /// 待确认 = 状态为 PendingVerify 且 crc 匹配 (回滚引导器首次启动后)
     pub fn is_pending(&self) -> bool {
         self.ota_state == OtaImageState::PendingVerify && self.crc == ota_select_crc(self.ota_seq)
@@ -637,14 +689,15 @@ const fn build_crc32_table() -> [u32; 256] {
 
 const CRC32_TABLE: [u32; 256] = build_crc32_table();
 
-/// 活动序列号 = 两条中 `is_valid()` 且 `ota_seq` 最大者; 无有效条目 → `None`
+/// 活动序列号 = 两条中 `is_bootable()` 且 `ota_seq` 最大者; 无可启动条目 → `None`
 ///
-/// 注意: 这里按"valid 且 crc 通过"筛选, 与二级 bootloader 的选择一致 (未初始化
-/// 0xFF 的条目 crc 必然不符, 自然被排除)。
+/// 与二级 bootloader 的判定一致: NEW/PENDING_VERIFY/VALID 都算可启动。
+/// 若只认 Valid, 运行条目仍是 PENDING_VERIFY (确认失败) 时会回落到另一槽,
+/// `next_write` 可能把镜像写进**正在运行**的槽。
 pub fn active_seq(entries: &[OtaDataEntry; 2]) -> Option<u32> {
     let mut best: Option<u32> = None;
     for e in entries.iter() {
-        if e.is_valid() {
+        if e.is_bootable() {
             best = Some(best.map_or(e.ota_seq, |b| b.max(e.ota_seq)));
         }
     }
@@ -1123,6 +1176,47 @@ mod tests {
         let [a, b] = read_otadata(&buf);
         assert_eq!(active_seq(&[a, b]), Some(5));
         assert_eq!(active_slot(&[a, b], 2), Some(0)); // (5-1)%2=0 → ota_0
+    }
+
+    #[test]
+    fn active_seq_counts_pending_verify_as_running() {
+        // 运行中的新镜像 seq2 仍是 PENDING_VERIFY (确认失败), 另一槽 seq1 VALID。
+        // 引导器把 PENDING_VERIFY 视为可启动: active 必须是 seq2, 否则
+        // next_write 会把镜像写进正在运行的 slot1。
+        let mut buf = erased_otadata();
+        let e0 = OtaDataEntry::new(1, "1.0.0", OtaImageState::Valid);
+        let e1 = OtaDataEntry::new(2, "2.0.0", OtaImageState::PendingVerify);
+        buf[0..32].copy_from_slice(&e0.to_bytes());
+        buf[0x1000..0x1020].copy_from_slice(&e1.to_bytes());
+        let [a, b] = read_otadata(&buf);
+        assert_eq!(active_seq(&[a, b]), Some(2));
+        assert_eq!(active_slot(&[a, b], 2), Some(1));
+        assert_eq!(next_write(&[a, b], 2), (3, 0)); // 目标 ota_0, 非运行中的 ota_1
+
+        // ABORTED 条目不可启动: active 回落到 VALID 的 seq3
+        let mut buf2 = erased_otadata();
+        let e0 = OtaDataEntry::new(4, "3.0.0", OtaImageState::Aborted);
+        let e1 = OtaDataEntry::new(3, "2.0.0", OtaImageState::Valid);
+        buf2[0..32].copy_from_slice(&e0.to_bytes());
+        buf2[0x1000..0x1020].copy_from_slice(&e1.to_bytes());
+        let [a, b] = read_otadata(&buf2);
+        assert_eq!(active_seq(&[a, b]), Some(3));
+    }
+
+    #[test]
+    fn unescape_json_handles_escaped_slash_and_unicode() {
+        let mut out = heapless::String::<64>::new();
+        assert!(unescape_json("ws:\\/\\/192.168.1.7:8000\\/xiaozhi", &mut out).is_some());
+        assert_eq!(out.as_str(), "ws://192.168.1.7:8000/xiaozhi");
+
+        assert!(unescape_json("token\\u0031\\u0032\\\"x\\\\y", &mut out).is_some());
+        assert_eq!(out.as_str(), "token12\"x\\y");
+
+        // 非法转义 / 孤立代理 / 容量不足 → None
+        assert!(unescape_json("a\\q", &mut out).is_none());
+        assert!(unescape_json("\\uD83D", &mut out).is_none());
+        let mut tiny = heapless::String::<2>::new();
+        assert!(unescape_json("abcd", &mut tiny).is_none());
     }
 
     #[test]
